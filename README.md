@@ -1,5 +1,9 @@
 # TextS
 
+<p align="center">
+  <img src="Resources/AppIcon.png" alt="TextS app icon" width="144">
+</p>
+
 TextS is a macOS menu bar app that captures a screen region, recognizes its text, and copies the result to your clipboard. It also includes a command-line tool for images.
 
 ## Features
