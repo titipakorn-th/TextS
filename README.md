@@ -11,10 +11,12 @@ TextS is a macOS menu bar app that captures a screen region, recognizes its text
 - Start a screen capture with `⌘⇧2` or choose **Capture Text** from the menu bar.
 - Change the global shortcut and enable **Launch at Login** in **Settings…**.
 - See an on-screen confirmation and hear the macOS Glass sound when text is copied.
-- Recognize text with Apple Vision's automatic language detection and language correction.
+- Recognize text with automatic language detection and language correction.
 - Run OCR on an image from the command line.
 
-Vision supplies OCR models through macOS. TextS does not bundle separate language models. Language availability and recognition quality depend on macOS and the source image.
+TextS uses the OCR models built into macOS and does not bundle separate language models. On macOS 26.6.2, the default accurate recognizer reports 30 supported language and locale identifiers. These include Thai (`th-TH`), English (`en-US`), simplified Chinese (`zh-Hans`), traditional Chinese (`zh-Hant`), and Japanese (`ja-JP`).
+
+The list can change with macOS updates. It includes script and regional variants, and language support does not guarantee accurate recognition for every image.
 
 ## Requirements
 
