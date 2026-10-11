@@ -26,7 +26,11 @@ The list can change with macOS updates. It includes script and regional variants
 
 ## Build and install
 
-From the project directory, run:
+For the published app, download the macOS disk image from the [latest release](https://github.com/titipakorn-th/TextS/releases/latest). Open the DMG, drag `TextS.app` to Applications, then eject the mounted image.
+
+The 0.1.0 release supports Apple silicon and macOS 13 or later. It is ad-hoc signed and not notarized, so macOS may ask you to approve it before the first launch.
+
+To build from source, run:
 
 ```sh
 ./build-app.sh
