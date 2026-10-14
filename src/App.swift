@@ -70,7 +70,93 @@ private let hotKeyCallback: EventHandlerProcPtr = { _, _, userData in
     return noErr
 }
 
-private func captureAndRecognize() -> CaptureOutcome {
+/// Keeps one `textsniper-rs --server` process alive so Vision stays loaded
+/// between captures instead of starting a fresh OCR process every time.
+private final class OCRWorker: @unchecked Sendable {
+    private let process = Process()
+    private let input: FileHandle
+    private let output: FileHandle
+    private let queue = DispatchQueue(label: "com.prince.textsniper.ocr")
+
+    var isRunning: Bool { process.isRunning }
+
+    init?() {
+        process.executableURL = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/textsniper-rs")
+        process.arguments = ["--server"]
+        let outputPipe = Pipe()
+        let inputPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardInput = inputPipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+        input = inputPipe.fileHandleForWriting
+        output = outputPipe.fileHandleForReading
+    }
+
+    func recognize(at path: String, fast: Bool) -> CaptureOutcome {
+        queue.sync {
+            let request = fast ? "fast\t\(path)\n" : "\(path)\n"
+            do {
+                try input.write(contentsOf: Data(request.utf8))
+            } catch {
+                return .failure("Could not reach the OCR helper: \(error.localizedDescription)")
+            }
+            return readFrame()
+        }
+    }
+
+    func stop() {
+        if process.isRunning {
+            process.terminate()
+        }
+    }
+
+    private func readFrame() -> CaptureOutcome {
+        guard let header = readLine() else {
+            return .failure("The OCR helper stopped responding.")
+        }
+        let parts = header.split(separator: " ")
+        guard parts.count == 2, let length = Int(parts[1]), length >= 0 else {
+            return .failure("Unreadable response from the OCR helper.")
+        }
+        let payload = readExactly(length)
+        switch parts[0] {
+        case "OK":
+            return payload.isEmpty ? .failure("No text found") : .success
+        default:
+            return .failure(payload.isEmpty ? "Unreadable response from the OCR helper." : payload)
+        }
+    }
+
+    private func readLine() -> String? {
+        var bytes: [UInt8] = []
+        while let byte = readByte() {
+            if byte == UInt8(ascii: "\n") { break }
+            bytes.append(byte)
+        }
+        return bytes.isEmpty ? nil : String(decoding: bytes, as: UTF8.self)
+    }
+
+    private func readExactly(_ count: Int) -> String {
+        var data = Data()
+        while data.count < count {
+            guard let chunk = try? output.read(upToCount: count - data.count), !chunk.isEmpty else { break }
+            data.append(chunk)
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private func readByte() -> UInt8? {
+        guard let chunk = try? output.read(upToCount: 1), let byte = chunk.first else { return nil }
+        return byte
+    }
+}
+
+private func captureAndRecognize(ocr: OCRWorker, fast: Bool, onRecognizing: () -> Void) -> CaptureOutcome {
     let pasteboard = NSPasteboard.general
     let initialChangeCount = DispatchQueue.main.sync { pasteboard.changeCount }
     let capture = Process()
@@ -98,29 +184,18 @@ private func captureAndRecognize() -> CaptureOutcome {
         return .failure("Could not save the cropped image: \(error.localizedDescription)")
     }
 
-    let recognizer = Process()
-    recognizer.executableURL = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/textsniper-rs")
-    recognizer.arguments = [imageURL.path]
-    let output = Pipe()
-    recognizer.standardOutput = output
-    recognizer.standardError = output
-    do {
-        try recognizer.run()
-        let message = output.fileHandleForReading.readDataToEndOfFile()
-        recognizer.waitUntilExit()
-        guard recognizer.terminationStatus == 0 else {
-            return .failure(String(decoding: message, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-        return .success
-    } catch {
-        return .failure("Could not start OCR: \(error.localizedDescription)")
-    }
+    onRecognizing()
+    return ocr.recognize(at: imageURL.path, fast: fast)
 }
 
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var captureItem: NSMenuItem!
+    private var updateItem: NSMenuItem!
+    private var checkItem: NSMenuItem!
+    private var versionItem: NSMenuItem!
+    private var availableRelease: ReleaseInfo?
     private var loginControl: NSButton!
     private var loginDescription: NSTextField!
     private var shortcutControl: NSButton!
@@ -135,6 +210,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var feedbackIcon: NSImageView?
     private var feedbackDismissal: DispatchWorkItem?
     private var feedbackGeneration = 0
+    private var ocrWorker: OCRWorker?
+    private var fastControl: NSButton!
+    private var fastDescription: NSTextField!
+    private var fastRecognition: Bool { UserDefaults.standard.bool(forKey: "fastRecognition") }
     private let successSound = NSSound(contentsOfFile: "/System/Library/Sounds/Glass.aiff", byReference: true)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -149,6 +228,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsItem.target = self
         menu.addItem(settingsItem)
         menu.addItem(.separator())
+        updateItem = NSMenuItem(title: "Update", action: #selector(installUpdate), keyEquivalent: "")
+        updateItem.target = self
+        updateItem.isHidden = true
+        menu.addItem(updateItem)
+        checkItem = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
+        checkItem.target = self
+        menu.addItem(checkItem)
+        versionItem = NSMenuItem(title: "Version \(Updater.currentVersion)", action: nil, keyEquivalent: "")
+        versionItem.isEnabled = false
+        menu.addItem(versionItem)
+        menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit TextS", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -158,18 +248,29 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.delegate = self
         registerHotKey()
         createSettingsWindow()
+        startOCR()
+        checkForUpdatesInBackground()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         if let hotKey { UnregisterEventHotKey(hotKey) }
         if let eventHandler { RemoveEventHandler(eventHandler) }
+        ocrWorker?.stop()
+        ocrWorker = nil
     }
 
     @objc func capture() {
         guard !isCapturing else { return }
+        guard let worker = ensureOCR() else {
+            showFeedback(title: "Couldn’t copy text", detail: "Could not start OCR.", success: false)
+            return
+        }
         isCapturing = true
+        let fast = fastRecognition
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let outcome = captureAndRecognize()
+            let outcome = captureAndRecognize(ocr: worker, fast: fast) {
+                DispatchQueue.main.async { self?.showRecognizing() }
+            }
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isCapturing = false
@@ -261,6 +362,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         shortcutRow.alignment = .centerY
         shortcutRow.distribution = .equalSpacing
 
+        fastControl = NSButton(checkboxWithTitle: "Faster recognition", target: self, action: #selector(toggleFastRecognition))
+        fastDescription = NSTextField(wrappingLabelWithString: "Quicker results, with slightly less accurate text.")
+        fastDescription.font = NSFont.systemFont(ofSize: 11)
+        fastDescription.textColor = .secondaryLabelColor
+        fastDescription.maximumNumberOfLines = 2
+        let fastRow = NSStackView(views: [fastControl, fastDescription])
+        fastRow.orientation = .vertical
+        fastRow.alignment = .leading
+        fastRow.spacing = 4
+
         loginControl = NSButton(checkboxWithTitle: "Launch at Login", target: self, action: #selector(toggleLaunchAtLogin))
         loginDescription = NSTextField(wrappingLabelWithString: "Open TextS automatically when you sign in.")
         loginDescription.font = .systemFont(ofSize: 11)
@@ -276,7 +387,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         note.textColor = .tertiaryLabelColor
 
         let divider = separator()
-        let stack = NSStackView(views: [header, divider, sectionTitle, shortcutRow, loginRow, note])
+        let stack = NSStackView(views: [header, divider, sectionTitle, shortcutRow, fastRow, loginRow, note])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 19
@@ -302,12 +413,49 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         window.center()
         settingsWindow = window
         updateLoginAtStartupState()
+        updateFastRecognitionState()
+    }
+
+    @objc private func toggleFastRecognition() {
+        UserDefaults.standard.set(fastControl.state == .on, forKey: "fastRecognition")
+    }
+
+    private func updateFastRecognitionState() {
+        fastControl.state = fastRecognition ? .on : .off
     }
 
     private func separator() -> NSView {
         let line = NSBox()
         line.boxType = .separator
         return line
+    }
+
+    private func positionFeedback(_ panel: NSPanel) {
+        let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
+        if let visibleFrame = screen?.visibleFrame {
+            panel.setFrameOrigin(NSPoint(x: visibleFrame.midX - panel.frame.width / 2,
+                                         y: visibleFrame.minY + 20))
+        }
+        panel.alphaValue = 1
+        panel.orderFrontRegardless()
+    }
+
+    /// Shown as soon as a region is selected, so a slow recognition reads as
+    /// progress instead of a hang. `showFeedback` replaces it with the result.
+    private func showRecognizing() {
+        if feedbackPanel == nil { createFeedbackPanel() }
+        guard let panel = feedbackPanel,
+              let icon = feedbackIcon,
+              let titleLabel = feedbackTitle,
+              let detailLabel = feedbackDetail else { return }
+
+        feedbackDismissal?.cancel()
+        feedbackGeneration += 1
+        icon.image = NSImage(systemSymbolName: "text.viewfinder", accessibilityDescription: "Recognizing")
+        icon.contentTintColor = .controlAccentColor
+        titleLabel.stringValue = "Recognizing…"
+        detailLabel.stringValue = "Working on your selection."
+        positionFeedback(panel)
     }
 
     private func showFeedback(title: String, detail: String, success: Bool) {
@@ -326,13 +474,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         titleLabel.stringValue = title
         detailLabel.stringValue = detail
 
-        let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
-        if let visibleFrame = screen?.visibleFrame {
-            panel.setFrameOrigin(NSPoint(x: visibleFrame.midX - panel.frame.width / 2,
-                                         y: visibleFrame.minY + 20))
-        }
-        panel.alphaValue = 1
-        panel.orderFrontRegardless()
+        positionFeedback(panel)
 
         feedbackDismissal?.cancel()
         feedbackGeneration += 1
@@ -431,6 +573,107 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Loads the OCR models at launch so the first capture finds them already
+    /// in memory, and keeps one helper process alive for the whole session.
+    private func startOCR() {
+        guard let worker = ensureOCR() else { return }
+        guard let imageURL = Self.warmupImage() else { return }
+        DispatchQueue.global(qos: .utility).async {
+            _ = worker.recognize(at: imageURL.path, fast: false)
+            try? FileManager.default.removeItem(at: imageURL)
+        }
+    }
+
+    private func ensureOCR() -> OCRWorker? {
+        if let worker = ocrWorker, worker.isRunning { return worker }
+        ocrWorker = OCRWorker()
+        return ocrWorker
+    }
+
+    private static func warmupImage() -> URL? {
+        let size = NSSize(width: 180, height: 48)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        NSColor.white.setFill()
+        NSRect(origin: .zero, size: size).fill()
+        ("TextS" as NSString).draw(at: NSPoint(x: 14, y: 15),
+                                   withAttributes: [.font: NSFont.systemFont(ofSize: 24),
+                                                    .foregroundColor: NSColor.black])
+        image.unlockFocus()
+        guard let tiff = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff),
+              let png = bitmap.representation(using: .png, properties: [:]) else { return nil }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("textsniper-warmup-\(UUID().uuidString).png")
+        do {
+            try png.write(to: url)
+            return url
+        } catch {
+            return nil
+        }
+    }
+
+    @objc private func checkForUpdates() {
+        Updater.checkLatest { [weak self] release in
+            guard let self else { return }
+            if let release {
+                self.applyAvailable(release)
+                self.showFeedback(title: "Update available",
+                                  detail: "TextS \(release.version) is ready to install.",
+                                  success: true)
+            } else {
+                self.showFeedback(title: "You’re up to date",
+                                  detail: "TextS \(Updater.currentVersion) is the latest version.",
+                                  success: true)
+            }
+        }
+    }
+
+    /// Quiet launch-time check, at most once every six hours so the menu never
+    /// waits on the network.
+    private func checkForUpdatesInBackground() {
+        let lastCheck = UserDefaults.standard.object(forKey: "lastUpdateCheck") as? Date ?? .distantPast
+        guard Date().timeIntervalSince(lastCheck) > 6 * 60 * 60 else { return }
+        UserDefaults.standard.set(Date(), forKey: "lastUpdateCheck")
+        Updater.checkLatest { [weak self] release in
+            guard let self, let release else { return }
+            self.applyAvailable(release)
+        }
+    }
+
+    private func applyAvailable(_ release: ReleaseInfo) {
+        availableRelease = release
+        updateItem.title = "Update to \(release.version)…"
+        updateItem.isHidden = false
+    }
+
+    @objc private func installUpdate() {
+        guard let release = availableRelease else { return }
+        updateItem.isEnabled = false
+        showFeedback(title: "Updating TextS", detail: "Downloading \(release.version)…", success: true)
+        Updater.install(release,
+                        progress: { [weak self] message in
+                            DispatchQueue.main.async {
+                                self?.showFeedback(title: "Updating TextS", detail: message, success: true)
+                            }
+                        },
+                        completion: { [weak self] result in
+                            guard let self else { return }
+                            self.updateItem.isEnabled = true
+                            switch result {
+                            case .success:
+                                self.showFeedback(title: "Update installed",
+                                                  detail: "Restarting TextS…",
+                                                  success: true)
+                                Updater.relaunch()
+                            case .failure(let error):
+                                self.showFeedback(title: "Couldn’t update",
+                                                  detail: error.message,
+                                                  success: false)
+                            }
+                        })
+    }
+
     private func registerHotKey() {
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         let handlerStatus = InstallEventHandler(
@@ -497,6 +740,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         updateLoginAtStartupState()
+        checkForUpdatesInBackground()
     }
 }
 

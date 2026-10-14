@@ -3,6 +3,7 @@
 use std::{
     env,
     ffi::{CStr, CString, c_char},
+    io::{self, BufRead, Write},
     path::{Path, PathBuf},
     process::Command,
     ptr,
@@ -26,19 +27,29 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let mut image = None;
+    let mut server = false;
     for arg in env::args_os().skip(1) {
         if arg == "--help" || arg == "-h" {
-            println!("Usage: textsniper-rs [IMAGE]\n\nSelect a screen region or OCR an image, then copy recognized text to the clipboard.");
+            println!("Usage: textsniper-rs [--server] [IMAGE]\n\nSelect a screen region or OCR an image, then copy recognized text to the clipboard.\n\nWith --server, read one request per line from standard input and answer each with\na single line of \"OK <bytes>\" or \"ERROR <bytes>\" followed by that many bytes of\nUTF-8. A request is an image path, optionally prefixed with \"fast\\t\" for the quicker\nrecognition level. The process stays alive so the OCR models stay loaded.");
             return Ok(());
+        } else if arg == "--server" {
+            server = true;
         } else if image.replace(PathBuf::from(arg)).is_some() {
             return Err("pass one image path".into());
         }
     }
 
+    if server {
+        if image.is_some() {
+            return Err("--server reads image paths from standard input, not arguments".into());
+        }
+        return serve();
+    }
+
     let text = if let Some(path) = image.as_deref() {
-        recognize(path)?
+        recognize(path, false)?
     } else {
-        recognize_data(&capture_region()?)?
+        recognize_data(&capture_region()?, false)?
     };
 
     if text.trim().is_empty() {
@@ -47,6 +58,45 @@ fn run() -> Result<(), String> {
     print!("{text}");
     set_clipboard(&text)?;
     Ok(())
+}
+
+/// Keeps Vision loaded between requests. Each input line is an image path,
+/// optionally prefixed with `fast\t` to use the quicker recognition level. Every
+/// request answers with one length-prefixed frame, so a caller can stay
+/// connected for the lifetime of the app instead of paying process start on
+/// every capture.
+fn serve() -> Result<(), String> {
+    let stdin = io::stdin();
+    let mut stdout = io::stdout().lock();
+    for line in stdin.lock().lines() {
+        let line = line.map_err(|error| format!("could not read standard input: {error}"))?;
+        let (level, path) = match line.split_once('\t') {
+            Some((level, path)) => (level.trim(), path.trim()),
+            None => ("accurate", line.trim()),
+        };
+        if path.is_empty() {
+            continue;
+        }
+        let outcome = recognize(Path::new(path), level == "fast").and_then(|text| {
+            if text.trim().is_empty() {
+                return Err("no text found".into());
+            }
+            set_clipboard(&text)?;
+            Ok(text)
+        });
+        match outcome {
+            Ok(text) => write_frame(&mut stdout, "OK", &text),
+            Err(message) => write_frame(&mut stdout, "ERROR", &message),
+        }?;
+    }
+    Ok(())
+}
+
+fn write_frame(output: &mut impl Write, status: &str, payload: &str) -> Result<(), String> {
+    write!(output, "{status} {}\n", payload.len())
+        .and_then(|()| output.write_all(payload.as_bytes()))
+        .and_then(|()| output.flush())
+        .map_err(|error| format!("could not write result: {error}"))
 }
 
 fn capture_region() -> Result<Vec<u8>, String> {
@@ -88,12 +138,12 @@ fn capture_region() -> Result<Vec<u8>, String> {
     }
 }
 
-fn recognize(path: &Path) -> Result<String, String> {
+fn recognize(path: &Path, fast: bool) -> Result<String, String> {
     let image = std::fs::read(path).map_err(|error| format!("could not read image: {error}"))?;
-    recognize_data(&image)
+    recognize_data(&image, fast)
 }
 
-fn recognize_data(image_data: &[u8]) -> Result<String, String> {
+fn recognize_data(image_data: &[u8], fast: bool) -> Result<String, String> {
     if image_data.is_empty() {
         return Err("image is empty".into());
     }
@@ -110,6 +160,10 @@ fn recognize_data(image_data: &[u8]) -> Result<String, String> {
             let _: () = msg_send![request, setAutomaticallyDetectsLanguage: true];
         }
         let _: () = msg_send![request, setUsesLanguageCorrection: true];
+        if fast {
+            // VNRequestTextRecognitionLevelFast is 1.
+            let _: () = msg_send![request, setRecognitionLevel: 1_isize];
+        }
         let requests: Id = msg_send![class!(NSArray), arrayWithObject: request];
         let mut error: Id = ptr::null_mut();
         let succeeded: bool = msg_send![handler, performRequests: requests error: &mut error];
