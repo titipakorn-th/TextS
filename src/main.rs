@@ -15,8 +15,19 @@ use objc::runtime::Object;
 type Id = *mut Object;
 
 #[link(name = "AppKit", kind = "framework")]
+#[link(name = "CoreFoundation", kind = "framework")]
+#[link(name = "ImageIO", kind = "framework")]
 #[link(name = "Vision", kind = "framework")]
 unsafe extern "C" {}
+
+type CFTypeRef = *mut std::ffi::c_void;
+
+unsafe extern "C" {
+    fn CGImageSourceCreateWithData(data: CFTypeRef, options: CFTypeRef) -> CFTypeRef;
+    fn CGImageSourceGetCount(source: CFTypeRef) -> isize;
+    fn CGImageSourceCopyPropertiesAtIndex(source: CFTypeRef, index: isize, options: CFTypeRef) -> CFTypeRef;
+    fn CFRelease(value: CFTypeRef);
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -77,7 +88,7 @@ fn serve() -> Result<(), String> {
         if path.is_empty() {
             continue;
         }
-        let outcome = recognize(Path::new(path), level == "fast").and_then(|text| {
+        let outcome = recognize_with_retry(Path::new(path), level == "fast").and_then(|text| {
             if text.trim().is_empty() {
                 return Err("no text found".into());
             }
@@ -143,6 +154,17 @@ fn recognize(path: &Path, fast: bool) -> Result<String, String> {
     recognize_data(&image, fast)
 }
 
+/// A read that fails straight after the models finish loading is transient, so
+/// give it one more go before reporting a problem. `no text found` is a real
+/// answer about the image rather than a failed read, so it is passed straight
+/// through.
+fn recognize_with_retry(path: &Path, fast: bool) -> Result<String, String> {
+    match recognize(path, fast) {
+        Err(error) if error != "no text found" => recognize(path, fast),
+        outcome => outcome,
+    }
+}
+
 fn recognize_data(image_data: &[u8], fast: bool) -> Result<String, String> {
     if image_data.is_empty() {
         return Err("image is empty".into());
@@ -150,10 +172,30 @@ fn recognize_data(image_data: &[u8], fast: bool) -> Result<String, String> {
     let image_length = image_data.len();
     unsafe {
         let pool: Id = msg_send![class!(NSAutoreleasePool), new];
+        // The size check reads the header through a temporary NSData, so it has
+        // to run inside the pool. Before it, that object has nowhere to go and
+        // leaks a copy of the image on every capture.
+        let (width, height) = match pixel_size(image_data) {
+            Ok(size) => size,
+            Err(error) => {
+                let _: () = msg_send![pool, drain];
+                return Err(error);
+            }
+        };
+        if width < 2 || height < 2 {
+            let _: () = msg_send![pool, drain];
+            return Err(format!(
+                "That selection is {width} by {height} pixels. Select a larger area."
+            ));
+        }
         let image: Id = msg_send![class!(NSData), dataWithBytes: image_data.as_ptr() length: image_length];
         let handler: Id = msg_send![class!(VNImageRequestHandler), alloc];
         let options: Id = msg_send![class!(NSDictionary), dictionary];
         let handler: Id = msg_send![handler, initWithData: image options: options];
+        // `alloc`/`init` and `new` both return +1 ownership that the autorelease
+        // pool does not adopt. This process serves every capture for the whole
+        // app session, so leaving these alive grows memory without bound until
+        // the image reader starts failing.
         let request: Id = msg_send![class!(VNRecognizeTextRequest), new];
         let supports_language_detection: bool = msg_send![request, respondsToSelector: sel!(setAutomaticallyDetectsLanguage:)];
         if supports_language_detection {
@@ -169,12 +211,14 @@ fn recognize_data(image_data: &[u8], fast: bool) -> Result<String, String> {
         let succeeded: bool = msg_send![handler, performRequests: requests error: &mut error];
         if !succeeded {
             let message = if error.is_null() {
-                "Vision OCR failed".to_string()
+                String::new()
             } else {
                 object_string(msg_send![error, localizedDescription])
             };
+            release(request);
+            release(handler);
             let _: () = msg_send![pool, drain];
-            return Err(message);
+            return Err(friendly_error(&message));
         }
 
         let observations: Id = msg_send![request, results];
@@ -191,9 +235,61 @@ fn recognize_data(image_data: &[u8], fast: bool) -> Result<String, String> {
             let value: Id = msg_send![candidate, string];
             lines.push(object_string(value));
         }
+        release(request);
+        release(handler);
         let _: () = msg_send![pool, drain];
         Ok(lines.join("\n"))
     }
+}
+
+unsafe fn release(object: Id) {
+    let _: () = msg_send![object, release];
+}
+
+/// Reads the pixel size from the header alone, so a thin selection is reported
+/// as such instead of reaching the image reader.
+fn pixel_size(image_data: &[u8]) -> Result<(usize, usize), String> {
+    unsafe {
+        let data: Id = msg_send![class!(NSData), dataWithBytes: image_data.as_ptr() length: image_data.len()];
+        let source = CGImageSourceCreateWithData(data as CFTypeRef, ptr::null_mut());
+        if source.is_null() {
+            return Err("TextS could not read that selection. Select it again.".into());
+        }
+        let count = CGImageSourceGetCount(source);
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, ptr::null_mut());
+        let dimension = |key: &str| -> Option<usize> {
+            if properties.is_null() {
+                return None;
+            }
+            let key = CString::new(key).unwrap();
+            let key: Id = msg_send![class!(NSString), stringWithUTF8String: key.as_ptr()];
+            let number: Id = msg_send![properties as Id, objectForKey: key];
+            if number.is_null() {
+                return None;
+            }
+            let value: usize = msg_send![number, unsignedIntegerValue];
+            Some(value)
+        };
+        let size = (dimension("PixelWidth"), dimension("PixelHeight"));
+        if !properties.is_null() {
+            CFRelease(properties as CFTypeRef);
+        }
+        CFRelease(source);
+        return match size {
+            (Some(width), Some(height)) if count > 0 && width > 0 && height > 0 => Ok((width, height)),
+            _ => Err("TextS could not read that selection. Select it again.".into()),
+        };
+    }
+}
+
+/// Vision's own error strings name the framework and leave the user with
+/// nothing to act on, so replace them with guidance.
+fn friendly_error(message: &str) -> String {
+    let lowered = message.to_lowercase();
+    if lowered.contains("too small") || lowered.contains("zero-dimensioned") {
+        return "That selection is too small to read. Select a larger area.".into();
+    }
+    "TextS could not read that selection. Select it again, or choose a larger area.".into()
 }
 
 unsafe fn object_string(value: Id) -> String {

@@ -80,6 +80,26 @@ private final class OCRWorker: @unchecked Sendable {
 
     var isRunning: Bool { process.isRunning }
 
+    /// Vision keeps state for every image it reads, so this is a backstop, not
+    /// the main defence: the helper now holds steady at around 190 MB. It
+    /// exists because runaway growth shows up as an unreadable image rather
+    /// than as an error anyone can act on, and a restart recovers cleanly.
+    private static let residentByteLimit: UInt64 = 600 * 1024 * 1024
+
+    var overMemoryLimit: Bool { residentSize > Self.residentByteLimit }
+
+    private var residentSize: UInt64 {
+        guard process.isRunning else { return 0 }
+        var info = proc_taskinfo()
+        let size = Int32(MemoryLayout<proc_taskinfo>.size)
+        // `task_info` needs a Mach port, not a pid, so this is the route that
+        // works against a child process we only know by pid.
+        guard proc_pidinfo(process.processIdentifier, PROC_PIDTASKINFO, 0, &info, size) == size else {
+            return 0
+        }
+        return UInt64(info.pti_resident_size)
+    }
+
     init?() {
         process.executableURL = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/textsniper-rs")
         process.arguments = ["--server"]
@@ -156,8 +176,23 @@ private final class OCRWorker: @unchecked Sendable {
     }
 }
 
+/// Copies what the user had on the pasteboard. `screencapture -c` writes the
+/// selection there, and without this the screenshot stays on the clipboard for
+/// the whole recognition, so reaching for it mid-capture pastes a picture.
+private func snapshot(_ pasteboard: NSPasteboard) -> [NSPasteboardItem]? {
+    guard let items = pasteboard.pasteboardItems else { return nil }
+    return items.map { item in
+        let copy = NSPasteboardItem()
+        for type in item.types {
+            if let data = item.data(forType: type) { copy.setData(data, forType: type) }
+        }
+        return copy
+    }
+}
+
 private func captureAndRecognize(ocr: OCRWorker, fast: Bool, onRecognizing: () -> Void) -> CaptureOutcome {
     let pasteboard = NSPasteboard.general
+    let saved = DispatchQueue.main.sync { snapshot(pasteboard) }
     let initialChangeCount = DispatchQueue.main.sync { pasteboard.changeCount }
     let capture = Process()
     capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
@@ -170,9 +205,17 @@ private func captureAndRecognize(ocr: OCRWorker, fast: Bool, onRecognizing: () -
     }
     guard capture.terminationStatus == 0 else { return .failure("Capture canceled") }
 
-    let imageData = DispatchQueue.main.sync {
-        guard pasteboard.changeCount != initialChangeCount else { return nil as Data? }
-        return pasteboard.data(forType: .png) ?? pasteboard.data(forType: .tiff)
+    let imageData: Data? = DispatchQueue.main.sync { () -> Data? in
+        guard pasteboard.changeCount != initialChangeCount else { return nil }
+        let data = pasteboard.data(forType: .png) ?? pasteboard.data(forType: .tiff)
+        // Hand the clipboard back before the slow part starts. OCR overwrites it
+        // with the recognized text when it finishes, but nothing should be
+        // holding the cropped screenshot in the meantime.
+        if let saved {
+            pasteboard.clearContents()
+            pasteboard.writeObjects(saved)
+        }
+        return data
     }
     guard let imageData else { return .failure("No cropped image was captured") }
 
@@ -248,7 +291,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.delegate = self
         registerHotKey()
         createSettingsWindow()
-        startOCR()
+        _ = ensureOCR()
         checkForUpdatesInBackground()
     }
 
@@ -573,10 +616,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Loads the OCR models at launch so the first capture finds them already
-    /// in memory, and keeps one helper process alive for the whole session.
-    private func startOCR() {
-        guard let worker = ensureOCR() else { return }
+    /// Loads the OCR models ahead of the first capture so it does not wait on
+    /// them. The warmup is what a fresh helper gets, at launch and after a
+    /// restart alike.
+    private func warmOCR(_ worker: OCRWorker) {
         guard let imageURL = Self.warmupImage() else { return }
         DispatchQueue.global(qos: .utility).async {
             _ = worker.recognize(at: imageURL.path, fast: false)
@@ -584,21 +627,41 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Returns a running helper, starting or replacing one as needed. A helper
+    /// that has grown past its memory limit is retired here, so the next
+    /// capture gets a fresh process instead of a failed read.
     private func ensureOCR() -> OCRWorker? {
-        if let worker = ocrWorker, worker.isRunning { return worker }
-        ocrWorker = OCRWorker()
-        return ocrWorker
+        if let worker = ocrWorker, worker.isRunning, !worker.overMemoryLimit { return worker }
+        ocrWorker?.stop()
+        guard let worker = OCRWorker() else { return nil }
+        ocrWorker = worker
+        warmOCR(worker)
+        return worker
     }
 
+    /// Paints a page of dense body text, which is what actually pulls the
+    /// recognition models in. A sparse placeholder is recognized in about a
+    /// second and leaves the first real capture to pay tens of seconds, because
+    /// the cost tracks how much text there is to read, not how big the image is.
     private static func warmupImage() -> URL? {
-        let size = NSSize(width: 180, height: 48)
+        let size = NSSize(width: 1600, height: 600)
         let image = NSImage(size: size)
         image.lockFocus()
         NSColor.white.setFill()
         NSRect(origin: .zero, size: size).fill()
-        ("TextS" as NSString).draw(at: NSPoint(x: 14, y: 15),
-                                   withAttributes: [.font: NSFont.systemFont(ofSize: 24),
-                                                    .foregroundColor: NSColor.black])
+        var page = ""
+        for line in 0..<60 {
+            var text = ""
+            while text.count < 180 {
+                text += "TextS reads text from anywhere on your screen "
+            }
+            page += text + "\n"
+            if line == 24 { page += "\n" }
+        }
+        (page as NSString).draw(
+            in: NSRect(x: 24, y: 24, width: size.width - 48, height: size.height - 48),
+            withAttributes: [.font: NSFont.systemFont(ofSize: 11),
+                             .foregroundColor: NSColor.black])
         image.unlockFocus()
         guard let tiff = image.tiffRepresentation,
               let bitmap = NSBitmapImageRep(data: tiff),
