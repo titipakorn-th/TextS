@@ -22,6 +22,10 @@ unsafe extern "C" {}
 
 type CFTypeRef = *mut std::ffi::c_void;
 
+/// The message a broken recognizer produces. The quick level keeps working
+/// after the accurate one has failed, so this is the signal to fall back.
+const RECOGNIZER_FAILED: &str = "The macOS text recognizer stopped working.";
+
 unsafe extern "C" {
     fn CGImageSourceCreateWithData(data: CFTypeRef, options: CFTypeRef) -> CFTypeRef;
     fn CGImageSourceGetCount(source: CFTypeRef) -> isize;
@@ -39,15 +43,26 @@ fn main() {
 fn run() -> Result<(), String> {
     let mut image = None;
     let mut server = false;
+    let mut warmup = false;
     for arg in env::args_os().skip(1) {
         if arg == "--help" || arg == "-h" {
-            println!("Usage: textsniper-rs [--server] [IMAGE]\n\nSelect a screen region or OCR an image, then copy recognized text to the clipboard.\n\nWith --server, read one request per line from standard input and answer each with\na single line of \"OK <bytes>\" or \"ERROR <bytes>\" followed by that many bytes of\nUTF-8. A request is an image path, optionally prefixed with \"fast\\t\" for the quicker\nrecognition level. The process stays alive so the OCR models stay loaded.");
+            println!("Usage: textsniper-rs [--server] [--warmup] [IMAGE]\n\nSelect a screen region or OCR an image, then copy recognized text to the clipboard.\n\nWith --server, read one request per line from standard input and answer each with\na single line of \"OK <bytes>\", \"OKQUICK <bytes>\" or \"ERROR <bytes>\" followed by that\nmany bytes of UTF-8. A request is an image path, optionally prefixed with \"fast\\t\" for\nthe quicker recognition level. The process stays alive so the OCR models stay loaded.\n\nWith --warmup, load the recognition models for an image and exit. Nothing is printed\nor copied, and the exit code says whether the accurate recognizer works.");
             return Ok(());
         } else if arg == "--server" {
             server = true;
+        } else if arg == "--warmup" {
+            warmup = true;
         } else if image.replace(PathBuf::from(arg)).is_some() {
             return Err("pass one image path".into());
         }
+    }
+
+    if warmup {
+        let path = image.ok_or("--warmup needs an image path")?;
+        // Loads the models and reports whether the accurate recognizer works
+        // on this Mac. Nothing is printed and the clipboard is left alone.
+        let _ = recognize(path.as_path(), false)?;
+        return Ok(());
     }
 
     if server {
@@ -58,7 +73,8 @@ fn run() -> Result<(), String> {
     }
 
     let text = if let Some(path) = image.as_deref() {
-        recognize(path, false)?
+        let mut accurate_broken = false;
+        recognize_request(path, false, &mut accurate_broken).0?
     } else {
         recognize_data(&capture_region()?, false)?
     };
@@ -85,6 +101,11 @@ fn serve() -> Result<(), String> {
     // and the app starts a fresh helper for the next request.
     const MAX_CONSECUTIVE_ERRORS: u32 = 4;
     let mut consecutive_errors = 0;
+    // The accurate recognizer can fail on some Macs, and a failed request
+    // leaves it unusable for the rest of this process. Once that has
+    // happened, keep using the quick level, which keeps working, so every
+    // capture still produces text.
+    let mut accurate_broken = false;
     for line in stdin.lock().lines() {
         let line = line.map_err(|error| format!("could not read standard input: {error}"))?;
         let (level, path) = match line.split_once('\t') {
@@ -94,7 +115,8 @@ fn serve() -> Result<(), String> {
         if path.is_empty() {
             continue;
         }
-        let outcome = recognize_with_retry(Path::new(path), level == "fast").and_then(|text| {
+        let (text, quick) = recognize_request(Path::new(path), level == "fast", &mut accurate_broken);
+        let outcome = text.and_then(|text| {
             if text.trim().is_empty() {
                 return Err("no text found".into());
             }
@@ -106,7 +128,7 @@ fn serve() -> Result<(), String> {
         consecutive_errors = if failed { consecutive_errors + 1 } else { 0 };
         let retiring = consecutive_errors >= MAX_CONSECUTIVE_ERRORS;
         match outcome {
-            Ok(text) => write_frame(&mut stdout, "OK", &text)?,
+            Ok(text) => write_frame(&mut stdout, if quick { "OKQUICK" } else { "OK" }, &text)?,
             Err(message) => write_frame(&mut stdout, "ERROR", &message)?,
         }
         if retiring {
@@ -114,6 +136,31 @@ fn serve() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Runs one capture through the recognizer. The accurate level is tried
+/// first. When it fails, the same image goes through the quick level, which
+/// keeps working after the accurate one has broken. The second value says the
+/// text came from the quick level, so the caller can say so.
+fn recognize_request(
+    path: &Path,
+    fast: bool,
+    accurate_broken: &mut bool,
+) -> (Result<String, String>, bool) {
+    if fast {
+        return (recognize_with_retry(path, true), false);
+    }
+    if *accurate_broken {
+        return (recognize_with_retry(path, true), true);
+    }
+    match recognize_with_retry(path, false) {
+        Ok(text) => (Ok(text), false),
+        Err(error) if error == RECOGNIZER_FAILED => {
+            *accurate_broken = true;
+            (recognize_with_retry(path, true), true)
+        }
+        Err(error) => (Err(error), false),
+    }
 }
 
 fn write_frame(output: &mut impl Write, status: &str, payload: &str) -> Result<(), String> {
@@ -302,7 +349,7 @@ fn friendly_error(message: &str) -> String {
     if lowered.contains("too small") || lowered.contains("zero-dimensioned") {
         return "That selection is too small to read. Select a larger area.".into();
     }
-    "TextS could not read that selection. Select it again, or choose a larger area.".into()
+    RECOGNIZER_FAILED.into()
 }
 
 unsafe fn object_string(value: Id) -> String {
