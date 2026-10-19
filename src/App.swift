@@ -1,11 +1,19 @@
 import AppKit
 import Carbon.HIToolbox
+import Darwin
 import Foundation
 import ServiceManagement
 
 private enum CaptureOutcome {
+    /// The recognized text is on the clipboard.
     case success
-    case failure(String)
+    /// The user backed out of the region selection, so there is nothing to report.
+    case canceled
+    /// A real answer about the selection. Repeating it will not change it.
+    case rejected(String)
+    /// The helper could not answer. This is about the helper, not the
+    /// selection, and a fresh helper may still read it.
+    case helperFailed(String)
 }
 
 private struct GlobalShortcut: Codable {
@@ -86,6 +94,12 @@ private final class OCRWorker: @unchecked Sendable {
     /// than as an error anyone can act on, and a restart recovers cleanly.
     private static let residentByteLimit: UInt64 = 600 * 1024 * 1024
 
+    /// How long one request may take end to end. A large selection of dense
+    /// text can spend tens of seconds in recognition, so this leaves room for
+    /// the slowest real capture while still ending a request that is never
+    /// going to be answered.
+    private static let frameTimeout: TimeInterval = 90
+
     var overMemoryLimit: Bool { residentSize > Self.residentByteLimit }
 
     private var residentSize: UInt64 {
@@ -119,13 +133,17 @@ private final class OCRWorker: @unchecked Sendable {
 
     func recognize(at path: String, fast: Bool) -> CaptureOutcome {
         queue.sync {
+            // One deadline covers the whole frame. Reading the pipe directly
+            // waited for as long as the helper wanted, including forever when
+            // it wedged, and that left the app unable to capture anything again.
+            let deadline = Date().addingTimeInterval(Self.frameTimeout)
             let request = fast ? "fast\t\(path)\n" : "\(path)\n"
             do {
                 try input.write(contentsOf: Data(request.utf8))
             } catch {
-                return .failure("Could not reach the OCR helper: \(error.localizedDescription)")
+                return .helperFailed("Could not reach the OCR helper: \(error.localizedDescription)")
             }
-            return readFrame()
+            return readFrame(deadline: deadline)
         }
     }
 
@@ -135,44 +153,69 @@ private final class OCRWorker: @unchecked Sendable {
         }
     }
 
-    private func readFrame() -> CaptureOutcome {
-        guard let header = readLine() else {
-            return .failure("The OCR helper stopped responding.")
+    private func readFrame(deadline: Date) -> CaptureOutcome {
+        guard let header = readLine(deadline: deadline) else {
+            return .helperFailed("The OCR helper stopped responding.")
         }
         let parts = header.split(separator: " ")
         guard parts.count == 2, let length = Int(parts[1]), length >= 0 else {
-            return .failure("Unreadable response from the OCR helper.")
+            return .helperFailed("Unreadable response from the OCR helper.")
         }
-        let payload = readExactly(length)
+        guard let payload = readExactly(length, deadline: deadline) else {
+            return .helperFailed("The OCR helper stopped responding.")
+        }
         switch parts[0] {
         case "OK":
-            return payload.isEmpty ? .failure("No text found") : .success
+            return payload.isEmpty ? .rejected("No text found") : .success
+        case "ERROR":
+            return .rejected(payload.isEmpty ? "TextS could not read that selection." : payload)
         default:
-            return .failure(payload.isEmpty ? "Unreadable response from the OCR helper." : payload)
+            return .helperFailed("Unreadable response from the OCR helper.")
         }
     }
 
-    private func readLine() -> String? {
+    private func readLine(deadline: Date) -> String? {
         var bytes: [UInt8] = []
-        while let byte = readByte() {
-            if byte == UInt8(ascii: "\n") { break }
+        while let byte = readByte(deadline: deadline) {
+            if byte == UInt8(ascii: "\n") { return String(decoding: bytes, as: UTF8.self) }
             bytes.append(byte)
         }
-        return bytes.isEmpty ? nil : String(decoding: bytes, as: UTF8.self)
+        // A line that never arrived terminated is not a header, so it is not
+        // handed back as one.
+        return nil
     }
 
-    private func readExactly(_ count: Int) -> String {
+    /// Returns nil when the frame is short. Reporting the bytes that did arrive
+    /// would leave the rest of the frame in the pipe, and the next capture
+    /// would read that remainder as its header.
+    private func readExactly(_ count: Int, deadline: Date) -> String? {
         var data = Data()
         while data.count < count {
-            guard let chunk = try? output.read(upToCount: count - data.count), !chunk.isEmpty else { break }
+            guard let chunk = try? output.read(upToCount: count - data.count), !chunk.isEmpty else { return nil }
             data.append(chunk)
         }
         return String(decoding: data, as: UTF8.self)
     }
 
-    private func readByte() -> UInt8? {
+    private func readByte(deadline: Date) -> UInt8? {
+        guard waitReadable(deadline: deadline) else { return nil }
         guard let chunk = try? output.read(upToCount: 1), let byte = chunk.first else { return nil }
         return byte
+    }
+
+    /// Waits for the helper to write, up to the deadline. A hang is reported as
+    /// a failure the app can recover from, instead of a capture that never ends.
+    private func waitReadable(deadline: Date) -> Bool {
+        var descriptor = pollfd(fd: output.fileDescriptor, events: Int16(POLLIN), revents: 0)
+        while true {
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { return false }
+            let result = poll(&descriptor, 1, Int32(min(remaining, 1) * 1000))
+            if result > 0 { return Int32(descriptor.revents) & (POLLIN | POLLHUP | POLLERR) != 0 }
+            if result == 0 { continue }
+            if errno == EINTR { continue }
+            return false
+        }
     }
 }
 
@@ -190,7 +233,44 @@ private func snapshot(_ pasteboard: NSPasteboard) -> [NSPasteboardItem]? {
     }
 }
 
-private func captureAndRecognize(ocr: OCRWorker, fast: Bool, onRecognizing: () -> Void) -> CaptureOutcome {
+/// What the region selection produced.
+private enum RegionSelection {
+    case image(URL)
+    case canceled
+    case failed(String)
+}
+
+/// Reads the selection and hands it to the helper. The cropped image is kept
+/// when the helper fails to answer, so a broken helper costs a second attempt
+/// by a fresh one instead of failing every capture from then on. Re-selecting
+/// the region is not asked for again.
+private func captureSelection(
+    fast: Bool,
+    onRecognizing: @escaping () -> Void,
+    worker: @escaping () -> OCRWorker?,
+    replacement: @escaping () -> OCRWorker?
+) -> CaptureOutcome {
+    let imageURL: URL
+    switch selectRegion() {
+    case .image(let url):
+        imageURL = url
+    case .canceled:
+        return .canceled
+    case .failed(let message):
+        return .rejected(message)
+    }
+    defer { try? FileManager.default.removeItem(at: imageURL) }
+
+    guard let ocr = worker() else { return .rejected("Could not start OCR.") }
+    onRecognizing()
+    let outcome = ocr.recognize(at: imageURL.path, fast: fast)
+    guard case .helperFailed = outcome, let fresh = replacement() else { return outcome }
+    onRecognizing()
+    return fresh.recognize(at: imageURL.path, fast: fast)
+}
+
+/// Grabs the region `screencapture -i -c` writes to the clipboard.
+private func selectRegion() -> RegionSelection {
     let pasteboard = NSPasteboard.general
     let saved = DispatchQueue.main.sync { snapshot(pasteboard) }
     let initialChangeCount = DispatchQueue.main.sync { pasteboard.changeCount }
@@ -201,9 +281,9 @@ private func captureAndRecognize(ocr: OCRWorker, fast: Bool, onRecognizing: () -
         try capture.run()
         capture.waitUntilExit()
     } catch {
-        return .failure("Could not start screen capture: \(error.localizedDescription)")
+        return .failed("Could not start screen capture: \(error.localizedDescription)")
     }
-    guard capture.terminationStatus == 0 else { return .failure("Capture canceled") }
+    guard capture.terminationStatus == 0 else { return .canceled }
 
     let imageData: Data? = DispatchQueue.main.sync { () -> Data? in
         guard pasteboard.changeCount != initialChangeCount else { return nil }
@@ -217,18 +297,15 @@ private func captureAndRecognize(ocr: OCRWorker, fast: Bool, onRecognizing: () -
         }
         return data
     }
-    guard let imageData else { return .failure("No cropped image was captured") }
+    guard let imageData else { return .failed("No cropped image was captured") }
 
     let imageURL = FileManager.default.temporaryDirectory.appendingPathComponent("textsniper-\(UUID().uuidString).png")
-    defer { try? FileManager.default.removeItem(at: imageURL) }
     do {
         try imageData.write(to: imageURL)
     } catch {
-        return .failure("Could not save the cropped image: \(error.localizedDescription)")
+        return .failed("Could not save the cropped image: \(error.localizedDescription)")
     }
-
-    onRecognizing()
-    return ocr.recognize(at: imageURL.path, fast: fast)
+    return .image(imageURL)
 }
 
 @MainActor
@@ -244,6 +321,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var shortcutControl: NSButton!
     private var settingsWindow: NSWindow?
     private var isCapturing = false
+    private var didCapture = false
     private var shortcut = GlobalShortcut.loadSaved()
     private var hotKey: EventHotKeyRef?
     private var eventHandler: EventHandlerRef?
@@ -309,21 +387,30 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         isCapturing = true
+        didCapture = true
         let fast = fastRecognition
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let outcome = captureAndRecognize(ocr: worker, fast: fast) {
-                DispatchQueue.main.async { self?.showRecognizing() }
-            }
+            let outcome = captureSelection(
+                fast: fast,
+                onRecognizing: { DispatchQueue.main.async { self?.showRecognizing() } },
+                worker: { worker },
+                replacement: { DispatchQueue.main.sync { self?.restartOCR() } }
+            )
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isCapturing = false
                 switch outcome {
                 case .success:
                     self.showFeedback(title: "Copied to clipboard", detail: "Your text is ready to paste.", success: true)
-                case .failure(let message):
-                    if message != "Capture canceled" {
-                        self.showFeedback(title: "Couldn’t copy text", detail: message, success: false)
-                    }
+                case .canceled:
+                    break
+                case .rejected(let message):
+                    self.showFeedback(title: "Couldn’t copy text", detail: message, success: false)
+                case .helperFailed(let message):
+                    // This helper is no longer answering, so it is retired here
+                    // and the next capture starts a clean one.
+                    self.retireOCR()
+                    self.showFeedback(title: "Couldn’t copy text", detail: message, success: false)
                 }
             }
         }
@@ -628,15 +715,35 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Returns a running helper, starting or replacing one as needed. A helper
-    /// that has grown past its memory limit is retired here, so the next
-    /// capture gets a fresh process instead of a failed read.
+    /// that has grown past its memory limit, or that is no longer running, is
+    /// retired here so the next capture gets a fresh process.
     private func ensureOCR() -> OCRWorker? {
         if let worker = ocrWorker, worker.isRunning, !worker.overMemoryLimit { return worker }
         ocrWorker?.stop()
+        // Only the first helper of a session is warmed up. A replacement is
+        // about to carry a real capture, and the warm page would hold that
+        // capture for as long as the models take to load.
+        let shouldWarm = !didCapture
         guard let worker = OCRWorker() else { return nil }
         ocrWorker = worker
-        warmOCR(worker)
+        if shouldWarm { warmOCR(worker) }
         return worker
+    }
+
+    /// Replaces the helper after one failed to answer. Vision can settle into a
+    /// state where every request fails while the process still looks healthy,
+    /// and keeping that process made every later capture fail the same way
+    /// until TextS was restarted.
+    private func restartOCR() -> OCRWorker? {
+        retireOCR()
+        guard let worker = OCRWorker() else { return nil }
+        ocrWorker = worker
+        return worker
+    }
+
+    private func retireOCR() {
+        ocrWorker?.stop()
+        ocrWorker = nil
     }
 
     /// Paints a page of dense body text, which is what actually pulls the

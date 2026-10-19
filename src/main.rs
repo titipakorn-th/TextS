@@ -79,6 +79,12 @@ fn run() -> Result<(), String> {
 fn serve() -> Result<(), String> {
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
+    // A long-lived Vision session can end up failing every read while the
+    // process itself looks healthy. Answering the same failure forever left the
+    // app unable to recognize anything, so a run of failures ends the process
+    // and the app starts a fresh helper for the next request.
+    const MAX_CONSECUTIVE_ERRORS: u32 = 4;
+    let mut consecutive_errors = 0;
     for line in stdin.lock().lines() {
         let line = line.map_err(|error| format!("could not read standard input: {error}"))?;
         let (level, path) = match line.split_once('\t') {
@@ -95,10 +101,17 @@ fn serve() -> Result<(), String> {
             set_clipboard(&text)?;
             Ok(text)
         });
+        // An image with nothing on it is an answer, not a fault.
+        let failed = !matches!(outcome, Ok(_)) && !matches!(&outcome, Err(message) if message == "no text found");
+        consecutive_errors = if failed { consecutive_errors + 1 } else { 0 };
+        let retiring = consecutive_errors >= MAX_CONSECUTIVE_ERRORS;
         match outcome {
-            Ok(text) => write_frame(&mut stdout, "OK", &text),
-            Err(message) => write_frame(&mut stdout, "ERROR", &message),
-        }?;
+            Ok(text) => write_frame(&mut stdout, "OK", &text)?,
+            Err(message) => write_frame(&mut stdout, "ERROR", &message)?,
+        }
+        if retiring {
+            break;
+        }
     }
     Ok(())
 }
