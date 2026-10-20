@@ -4,7 +4,7 @@ import Darwin
 import Foundation
 import ServiceManagement
 
-private enum CaptureOutcome {
+enum CaptureOutcome {
     /// The recognized text is on the clipboard.
     case success
     /// The accurate recognizer failed and the quick one did the work.
@@ -82,7 +82,7 @@ private let hotKeyCallback: EventHandlerProcPtr = { _, _, userData in
 
 /// Keeps one `textsniper-rs --server` process alive so Vision stays loaded
 /// between captures instead of starting a fresh OCR process every time.
-private final class OCRWorker: @unchecked Sendable {
+final class OCRWorker: @unchecked Sendable {
     private let process = Process()
     private let input: FileHandle
     private let output: FileHandle
@@ -96,11 +96,17 @@ private final class OCRWorker: @unchecked Sendable {
     /// than as an error anyone can act on, and a restart recovers cleanly.
     private static let residentByteLimit: UInt64 = 600 * 1024 * 1024
 
-    /// How long one request may take end to end. A large selection of dense
-    /// text can spend tens of seconds in recognition, so this leaves room for
-    /// the slowest real capture while still ending a request that is never
-    /// going to be answered.
-    private static let frameTimeout: TimeInterval = 90
+    /// How long the accurate recognizer may take to answer. The models are
+    /// loaded before the first capture, so a healthy request answers in a
+    /// fraction of a second. A request that is still running after this has
+    /// hit the problem the app already knows about: the recognizer is slow or
+    /// broken on this Mac, and the quick one is the answer that can still come.
+    private static let accurateFrameTimeout: TimeInterval = 5
+
+    /// How long the quick recognizer may take. It carries a lighter model, so
+    /// it answers as soon as that model is loaded, even on a Mac where the
+    /// accurate model is slow to load.
+    private static let quickFrameTimeout: TimeInterval = 45
 
     var overMemoryLimit: Bool { residentSize > Self.residentByteLimit }
 
@@ -138,7 +144,12 @@ private final class OCRWorker: @unchecked Sendable {
             // One deadline covers the whole frame. Reading the pipe directly
             // waited for as long as the helper wanted, including forever when
             // it wedged, and that left the app unable to capture anything again.
-            let deadline = Date().addingTimeInterval(Self.frameTimeout)
+            // The accurate recognizer gets a short budget because its models
+            // are already loaded; the quick one gets longer, as it may still be
+            // loading its own.
+            let deadline = Date().addingTimeInterval(
+                fast ? Self.quickFrameTimeout : Self.accurateFrameTimeout
+            )
             let request = fast ? "fast\t\(path)\n" : "\(path)\n"
             do {
                 try input.write(contentsOf: Data(request.utf8))
@@ -248,34 +259,41 @@ private enum RegionSelection {
 /// when the helper fails to answer, so a broken helper costs a second attempt
 /// by a fresh one instead of failing every capture from then on. Re-selecting
 /// the region is not asked for again.
-///
-/// The time the recognition took comes back with the answer, because a slow
-/// recognition is something the app has to act on.
 private func captureSelection(
     fast: Bool,
     onRecognizing: @escaping () -> Void,
     worker: @escaping () -> OCRWorker?,
     replacement: @escaping () -> OCRWorker?
-) -> (CaptureOutcome, TimeInterval) {
+) -> CaptureOutcome {
     let imageURL: URL
     switch selectRegion() {
     case .image(let url):
         imageURL = url
     case .canceled:
-        return (.canceled, 0)
+        return .canceled
     case .failed(let message):
-        return (.rejected(message), 0)
+        return .rejected(message)
     }
     defer { try? FileManager.default.removeItem(at: imageURL) }
 
-    guard let ocr = worker() else { return (.rejected("Could not start OCR."), 0) }
+    guard let ocr = worker() else { return .rejected("Could not start OCR.") }
     onRecognizing()
-    let start = Date()
     let outcome = ocr.recognize(at: imageURL.path, fast: fast)
-    let seconds = Date().timeIntervalSince(start)
-    guard case .helperFailed = outcome, let fresh = replacement() else { return (outcome, seconds) }
+    guard case .helperFailed = outcome, let fresh = replacement() else { return outcome }
+    // The helper did not answer, so a fresh one reads the image that was
+    // already selected. It reads it with the quick recognizer: the accurate
+    // one is the part that stopped answering, and the quick one keeps working
+    // after the accurate one fails.
     onRecognizing()
-    return (fresh.recognize(at: imageURL.path, fast: fast), seconds)
+    return rereadWithQuickRecognizer(fresh, path: imageURL.path)
+}
+
+/// Reads an image again with a fresh helper and the quick recognizer. The
+/// answer comes from the quick recognizer, so it is reported as such.
+func rereadWithQuickRecognizer(_ worker: OCRWorker, path: String) -> CaptureOutcome {
+    let outcome = worker.recognize(at: path, fast: true)
+    if case .success = outcome { return .successQuick }
+    return outcome
 }
 
 /// Grabs the region `screencapture -i -c` writes to the clipboard.
@@ -402,7 +420,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         isCapturing = true
         let fast = fastRecognition || !accurateRecognizerReady
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let (outcome, seconds) = captureSelection(
+            let outcome = captureSelection(
                 fast: fast,
                 onRecognizing: { DispatchQueue.main.async { self?.showRecognizing() } },
                 worker: { worker },
@@ -413,14 +431,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.isCapturing = false
                 switch outcome {
                 case .success:
-                    // The accurate recognizer can need tens of seconds to load
-                    // its models on some Macs. One slow capture is enough to
-                    // know that it is not worth waiting for.
-                    let tooSlow = !fast && seconds > 5
-                    if tooSlow { self.accurateRecognizerReady = false }
+                    // The accurate recognizer answered inside its budget, so
+                    // the text came from it. The quick one steps in only when
+                    // the accurate one fails, which arrives as .successQuick.
                     // Only explain the quick recognizer when TextS chose it
                     // for itself, not when it was asked for in Settings.
-                    let usedQuick = !self.fastRecognition && (fast || tooSlow)
+                    let usedQuick = !self.fastRecognition && fast
                     self.showFeedback(title: "Copied to clipboard",
                                       detail: usedQuick ? "Recognized with the quick recognizer."
                                                         : "Your text is ready to paste.",
@@ -437,6 +453,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     // This helper is no longer answering, so it is retired here
                     // and the next capture starts a clean one.
                     self.retireOCR()
+                    // The accurate recognizer did not answer, so stop asking
+                    // for it and let the quick one read the next selection.
+                    if !fast { self.accurateRecognizerReady = false }
                     self.showFeedback(title: "Couldn’t copy text", detail: message, success: false)
                 }
             }
