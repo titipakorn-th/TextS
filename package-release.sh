@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="${0:A:h}"
-VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$ROOT/Info.plist")"
+VERSION="$(tr -d '[:space:]' < "$ROOT/version.txt")"
 ARCH="$(uname -m)"
 OUT="$ROOT/build/release-$VERSION"
 DMG_STAGE="$OUT/dmg"

@@ -2,3 +2,5 @@
 /build/
 /.build/
 /.audit/
+.DS_Store
+.worktrees/

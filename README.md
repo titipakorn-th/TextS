@@ -36,7 +36,7 @@ Some Macs load the accurate recognizer slowly, or stop it from working after the
 
 For the published app, download the macOS disk image from the [latest release](https://github.com/titipakorn-th/TextS/releases/latest). Open the DMG, drag `TextS.app` to Applications, then eject the mounted image.
 
-The 0.1.5 release supports Apple silicon and macOS 13 or later. It is ad-hoc signed and not notarized, so macOS may ask you to approve it before the first launch.
+The release supports Apple silicon and macOS 13 or later. It is ad-hoc signed and not notarized, so macOS may ask you to approve it before the first launch.
 
 Installed versions check GitHub for a newer release and offer to install it from the menu bar. The first launch of a downloaded update may ask you to approve the app again.
 
@@ -47,6 +47,8 @@ To build from source, run:
 ```
 
 The script builds the Rust OCR helper in release mode, compiles the macOS app, and creates `build/TextS.app` with an ad-hoc signature for local use.
+
+The version lives in `version.txt` and nowhere else. The build writes it into the app bundle and the Cargo manifest, so a new release only needs that one file changed.
 
 Copy the app to Applications:
 

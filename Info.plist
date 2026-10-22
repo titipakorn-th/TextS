@@ -4,14 +4,14 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
-	<key>CFBundleExecutable</key>
-	<string>TextS</string>
-	<key>CFBundleIdentifier</key>
-	<string>com.prince.textsniper</string>
 	<key>CFBundleDisplayName</key>
+	<string>TextS</string>
+	<key>CFBundleExecutable</key>
 	<string>TextS</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.prince.textsniper</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -19,9 +19,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.5</string>
+	<string>0.1.6</string>
 	<key>CFBundleVersion</key>
-	<string>5</string>
+	<string>6</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>LSUIElement</key>
