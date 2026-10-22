@@ -266,6 +266,10 @@ fn recognize_data(image_data: &[u8], fast: bool) -> Result<String, String> {
             // VNRequestTextRecognitionLevelFast is 1.
             let _: () = msg_send![request, setRecognitionLevel: 1_isize];
         }
+        // Tell Vision which languages this level can read. On its own the
+        // automatic detection settles on one language for the whole selection,
+        // so a screen that mixes Chinese and English loses the Chinese half.
+        set_supported_languages(request);
         let requests: Id = msg_send![class!(NSArray), arrayWithObject: request];
         let mut error: Id = ptr::null_mut();
         let succeeded: bool = msg_send![handler, performRequests: requests error: &mut error];
@@ -298,7 +302,57 @@ fn recognize_data(image_data: &[u8], fast: bool) -> Result<String, String> {
         release(request);
         release(handler);
         let _: () = msg_send![pool, drain];
-        Ok(lines.join("\n"))
+        let text = lines.join("\n");
+        if fast && text.trim().is_empty() {
+            // The quick recognizer has no model for Chinese, Japanese or
+            // Korean, so it finds nothing at all in a selection written in
+            // those scripts. The accurate recognizer reads them, so try that
+            // before reporting that the selection holds no text.
+            return recognize_data(image_data, false);
+        }
+        Ok(text)
+    }
+}
+
+/// Gives the request the languages its own recognition level supports, with
+/// the Chinese, Japanese and Korean models first. Vision reads a selection
+/// that mixes scripts with the first language in the list that fits, so a
+/// screen that shows Chinese next to English keeps both halves. The automatic
+/// detection still picks the language of a selection written in one script.
+fn set_supported_languages(request: Id) {
+    unsafe {
+        let supported: bool = msg_send![
+            request,
+            respondsToSelector: sel!(supportedRecognitionLanguagesAndReturnError:)
+        ];
+        if !supported {
+            return;
+        }
+        let mut error: Id = ptr::null_mut();
+        let languages: Id = msg_send![request, supportedRecognitionLanguagesAndReturnError: &mut error];
+        if languages.is_null() {
+            return;
+        }
+        const FIRST: [&str; 6] = ["zh-Hans", "zh-Hant", "yue-Hans", "yue-Hant", "ja-JP", "ko-KR"];
+        let count: usize = msg_send![languages, count];
+        let ordered: Id = msg_send![class!(NSMutableArray), array];
+        for wanted in FIRST {
+            for index in 0..count {
+                let language: Id = msg_send![languages, objectAtIndex: index];
+                if object_string(language) == wanted {
+                    let _: () = msg_send![ordered, addObject: language];
+                    break;
+                }
+            }
+        }
+        for index in 0..count {
+            let language: Id = msg_send![languages, objectAtIndex: index];
+            if FIRST.contains(&object_string(language).as_str()) {
+                continue;
+            }
+            let _: () = msg_send![ordered, addObject: language];
+        }
+        let _: () = msg_send![request, setRecognitionLanguages: ordered];
     }
 }
 
@@ -375,5 +429,54 @@ fn set_clipboard(text: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RECOGNIZER_FAILED, recognize_data};
+
+    const CHINESE: &[u8] = include_bytes!("../tests/fixtures/chinese.png");
+    const MIXED: &[u8] = include_bytes!("../tests/fixtures/mixed.png");
+    const CHINESE_SMALL: &[u8] = include_bytes!("../tests/fixtures/chinese_small.png");
+
+    /// Reads a fixture, or reports that the recognizer on this Mac stopped
+    /// working. It does that on some Macs, and a check that cannot run is not
+    /// a failure.
+    fn read(fixture: &[u8], fast: bool) -> Option<String> {
+        match recognize_data(fixture, fast) {
+            Ok(text) => Some(text),
+            Err(error) if error == RECOGNIZER_FAILED => {
+                eprintln!("skipped: the macOS recognizer stopped working");
+                None
+            }
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// The accurate recognizer has to read Chinese.
+    #[test]
+    fn accurate_recognizer_reads_chinese() {
+        let Some(text) = read(CHINESE, false) else { return };
+        assert!(text.contains("你好，世界。"), "read {text:?}");
+    }
+
+    /// A selection that mixes Chinese with English has to keep the Chinese
+    /// half. Vision reads each line with the model that fits it best, so a
+    /// line that is mostly Chinese has to come back whole.
+    #[test]
+    fn accurate_recognizer_keeps_both_scripts_in_one_selection() {
+        let Some(text) = read(MIXED, false) else { return };
+        assert!(text.contains("偏好设置"), "read {text:?}");
+        assert!(text.contains("Preferences"), "read {text:?}");
+    }
+
+    /// The quick recognizer has no Chinese model, so it finds nothing in small
+    /// Chinese text. The helper reads it with the accurate recognizer instead
+    /// of telling the user the selection holds no text.
+    #[test]
+    fn quick_recognizer_falls_back_when_it_finds_nothing() {
+        let Some(text) = read(CHINESE_SMALL, true) else { return };
+        assert!(text.contains("这是一个中文识别测试。"), "read {text:?}");
+    }
 }
 

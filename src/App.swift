@@ -296,6 +296,45 @@ func rereadWithQuickRecognizer(_ worker: OCRWorker, path: String) -> CaptureOutc
     return outcome
 }
 
+/// Whether the accurate recognizer can be used after the setting changes.
+/// Turning the setting off brings it back, even when it stopped working
+/// earlier in the session, because the user asked for accurate text.
+func accurateRecognizerAfterToggle(settingOn: Bool, wasReady: Bool) -> Bool {
+    settingOn ? wasReady : true
+}
+
+/// The recognizer a capture uses.
+enum Recognizer {
+    case accurate
+    /// The quick one, because the setting asks for it.
+    case quickForSpeed
+    /// The quick one, because the accurate one is not working.
+    case quickBecauseAccurateFailed
+
+    /// True for the quick recognizer, which answers straight away.
+    var isQuick: Bool { self != .accurate }
+
+    /// What the settings window shows, so the mode in use is never a guess.
+    var status: String {
+        switch self {
+        case .accurate:
+            return "In use: the accurate recognizer."
+        case .quickForSpeed:
+            return "In use: the quick recognizer. Faster recognition is on."
+        case .quickBecauseAccurateFailed:
+            return "In use: the quick recognizer. The accurate one is not working."
+        }
+    }
+}
+
+/// Which recognizer a capture uses. The quick one answers straight away, but
+/// it cannot read every language, so the accurate one is used whenever it
+/// works.
+func recognizerInUse(settingOn: Bool, accurateReady: Bool) -> Recognizer {
+    if settingOn { return .quickForSpeed }
+    return accurateReady ? .accurate : .quickBecauseAccurateFailed
+}
+
 /// Grabs the region `screencapture -i -c` writes to the clipboard.
 private func selectRegion() -> RegionSelection {
     let pasteboard = NSPasteboard.general
@@ -364,6 +403,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var accurateRecognizerReady = false
     private var fastControl: NSButton!
     private var fastDescription: NSTextField!
+    private var recognizerStatus: NSTextField!
     private var fastRecognition: Bool { UserDefaults.standard.bool(forKey: "fastRecognition") }
     private let successSound = NSSound(contentsOfFile: "/System/Library/Sounds/Glass.aiff", byReference: true)
 
@@ -418,7 +458,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         isCapturing = true
-        let fast = fastRecognition || !accurateRecognizerReady
+        let fast = recognizerInUse(settingOn: fastRecognition, accurateReady: accurateRecognizerReady).isQuick
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let outcome = captureSelection(
                 fast: fast,
@@ -444,6 +484,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                 case .successQuick:
                     // The accurate recognizer failed, so stop asking for it.
                     self.accurateRecognizerReady = false
+                    self.updateRecognizerStatus()
                     self.showFeedback(title: "Copied to clipboard", detail: "Recognized with the quick recognizer.", success: true)
                 case .canceled:
                     break
@@ -456,6 +497,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     // The accurate recognizer did not answer, so stop asking
                     // for it and let the quick one read the next selection.
                     if !fast { self.accurateRecognizerReady = false }
+                    self.updateRecognizerStatus()
                     self.showFeedback(title: "Couldn’t copy text", detail: message, success: false)
                 }
             }
@@ -539,7 +581,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         shortcutRow.distribution = .equalSpacing
 
         fastControl = NSButton(checkboxWithTitle: "Faster recognition", target: self, action: #selector(toggleFastRecognition))
-        fastDescription = NSTextField(wrappingLabelWithString: "Quicker results, with slightly less accurate text.")
+        // The quick recognizer has a model for a few languages only, and it
+        // makes nonsense of the others instead of admitting it cannot read
+        // them. The setting says what it covers.
+        fastDescription = NSTextField(wrappingLabelWithString: "Quicker results for English, French, German, Italian, Spanish and Portuguese. Other languages can come back as nonsense.")
         fastDescription.font = NSFont.systemFont(ofSize: 11)
         fastDescription.textColor = .secondaryLabelColor
         fastDescription.maximumNumberOfLines = 2
@@ -547,6 +592,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         fastRow.orientation = .vertical
         fastRow.alignment = .leading
         fastRow.spacing = 4
+
+        recognizerStatus = NSTextField(wrappingLabelWithString: "")
+        recognizerStatus.font = .systemFont(ofSize: 11)
+        recognizerStatus.textColor = .secondaryLabelColor
 
         loginControl = NSButton(checkboxWithTitle: "Launch at Login", target: self, action: #selector(toggleLaunchAtLogin))
         loginDescription = NSTextField(wrappingLabelWithString: "Open TextS automatically when you sign in.")
@@ -563,7 +612,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         note.textColor = .tertiaryLabelColor
 
         let divider = separator()
-        let stack = NSStackView(views: [header, divider, sectionTitle, shortcutRow, fastRow, loginRow, note])
+        let stack = NSStackView(views: [header, divider, sectionTitle, shortcutRow, fastRow, recognizerStatus, loginRow, note])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 19
@@ -586,18 +635,39 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         window.title = "Settings"
         window.isReleasedWhenClosed = false
         window.contentView = content
+        content.layoutSubtreeIfNeeded()
+        // The window grows with its content, so a longer status line never
+        // pushes the last row out of view.
+        let fitting = stack.fittingSize
+        window.setContentSize(NSSize(width: 460, height: max(320, fitting.height + 50)))
         window.center()
         settingsWindow = window
         updateLoginAtStartupState()
         updateFastRecognitionState()
+        updateRecognizerStatus()
     }
 
     @objc private func toggleFastRecognition() {
-        UserDefaults.standard.set(fastControl.state == .on, forKey: "fastRecognition")
+        let on = fastControl.state == .on
+        UserDefaults.standard.set(on, forKey: "fastRecognition")
+        accurateRecognizerReady = accurateRecognizerAfterToggle(settingOn: on, wasReady: accurateRecognizerReady)
+        updateRecognizerStatus()
+        if !on {
+            // The helper that failed the accurate recognizer cannot read
+            // accurately any more, so give it a fresh one.
+            _ = restartOCR()
+        }
     }
 
     private func updateFastRecognitionState() {
         fastControl.state = fastRecognition ? .on : .off
+    }
+
+    /// Shows which recognizer the next capture uses, so the mode is never a
+    /// guess.
+    private func updateRecognizerStatus() {
+        recognizerStatus?.stringValue = recognizerInUse(settingOn: fastRecognition,
+                                                        accurateReady: accurateRecognizerReady).status
     }
 
     private func separator() -> NSView {
@@ -806,9 +876,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                 try warmup.run()
                 warmup.waitUntilExit()
                 let ready = warmup.terminationStatus == 0
-                DispatchQueue.main.async { self.accurateRecognizerReady = ready }
+                DispatchQueue.main.async {
+                    self.accurateRecognizerReady = ready
+                    self.updateRecognizerStatus()
+                }
             } catch {
-                DispatchQueue.main.async { self.accurateRecognizerReady = false }
+                DispatchQueue.main.async {
+                    self.accurateRecognizerReady = false
+                    self.updateRecognizerStatus()
+                }
             }
             try? FileManager.default.removeItem(at: imageURL)
         }

@@ -56,6 +56,28 @@ if let worker = OCRWorker() {
     worker.stop()
 }
 
+// Turning "Faster recognition" off has to bring the accurate recognizer back.
+// It stops working on some Macs after a request, and the app falls back to
+// the quick one, which cannot read Chinese, Japanese or Korean.
+check(accurateRecognizerAfterToggle(settingOn: false, wasReady: false),
+      "turning the setting off brings the accurate recognizer back")
+check(accurateRecognizerAfterToggle(settingOn: false, wasReady: true),
+      "turning the setting off keeps the accurate recognizer")
+check(accurateRecognizerAfterToggle(settingOn: true, wasReady: true),
+      "turning the setting on leaves the accurate recognizer as it was")
+check(!accurateRecognizerAfterToggle(settingOn: true, wasReady: false),
+      "turning the setting on leaves the accurate recognizer as it was")
+
+// The mode the settings window shows has to be the mode a capture uses.
+check(recognizerInUse(settingOn: false, accurateReady: true) == .accurate,
+      "the accurate recognizer is used when the setting is off and it works")
+check(recognizerInUse(settingOn: true, accurateReady: true) == .quickForSpeed,
+      "the quick recognizer is used when the setting is on")
+check(recognizerInUse(settingOn: false, accurateReady: false) == .quickBecauseAccurateFailed,
+      "the quick recognizer takes over when the accurate one is not working")
+check(recognizerInUse(settingOn: false, accurateReady: true).status != recognizerInUse(settingOn: true, accurateReady: true).status,
+      "the status line tells the two modes apart")
+
 if failures.isEmpty {
     print("all checks passed")
     exit(0)

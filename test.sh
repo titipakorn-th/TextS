@@ -6,6 +6,11 @@ BUILD="$ROOT/.build/test"
 ARCH="$(uname -m)"
 mkdir -p "$BUILD"
 
+# The OCR helper's own checks. The recognizer answers one request at a time,
+# so the tests run one after another.
+cd "$ROOT"
+cargo test -- --test-threads=1
+
 # The app sources are built as a module so the check drives the code the app
 # ships, not a copy of it.
 swiftc -parse-as-library -enable-testing -emit-module -emit-library \
