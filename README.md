@@ -13,16 +13,17 @@ TextS is a macOS menu bar app that captures a screen region, recognizes its text
 - Turn on **Faster recognition** in **Settings…** for quicker results with slightly less accurate text. The quick recognizer covers Latin text only; Chinese, Japanese and Korean need the accurate recognizer.
 - See an on-screen confirmation and hear the macOS Glass sound when text is copied.
 - Recognize text with automatic language detection and language correction.
-- Load the recognizer in the background at launch, so the first capture does not wait for it.
-- Keep working when the macOS recognizer fails or is slow, by falling back to the quicker recognizer.
+- Keep the recognizer loaded between captures.
+- Load the recognizer's models in the background at launch, so the first capture does not wait for them.
+- Retry a failed OCR helper once with a fresh process and the same recognition mode.
 - Update from the menu bar when a newer release is published.
 - Run OCR on an image from the command line.
 
-TextS uses the OCR models built into macOS and does not bundle separate language models. On macOS 27.0.1, the default accurate recognizer reports 33 supported language and locale identifiers. These include Thai (`th-TH`), English (`en-US`), simplified Chinese (`zh-Hans`), traditional Chinese (`zh-Hant`), Cantonese (`yue-Hans`), and Japanese (`ja-JP`).
+TextS uses the OCR models built into macOS and does not bundle separate language models. On macOS 27.0.1, the default accurate recognizer reports 33 supported language and locale identifiers. These include Thai (`th-TH`), English (`en-US`), simplified Chinese (`zh-Hans`), traditional Chinese (`zh-Hant`), Cantonese (`yue-Hans`), and Japanese (`ja-JP`). TextS reads all of them: the automatic detection picks the model for the script it finds, and TextS only asks macOS for a short list of languages so the ones it names win a line that mixes two scripts.
 
 The list can change with macOS updates. It includes script and regional variants, and language support does not guarantee accurate recognition for every image. A selection that mixes two scripts, such as a Chinese menu next to English words, is read line by line, and a line that is mostly Latin can lose its Chinese half.
 
-Some Macs load the accurate recognizer slowly, or stop it from working after the first request. TextS then reads the selection with the quicker recognizer and says so, so a capture still returns text. Turn **Faster recognition** in **Settings…** off and on again to bring the accurate recognizer back.
+With **Faster recognition** off, every capture uses the accurate recognizer, including retries after a helper failure. macOS compiles the recognizer's models the first time a picture is read, which on a cold Mac takes tens of seconds. Every language TextS asks for needs its own correction model, and building those is what makes the first read slow: asking for all thirty-three took 46 seconds to build, while the seven TextS asks for take a few seconds and read every script the same. TextS loads those models in the background at launch, and allows 90 seconds per capture so a model that is still compiling is not cut off. If a helper fails, TextS retries once with the same image and the same mode. If both attempts fail, TextS reports the error and keeps your selected mode for the next capture.
 
 **Faster recognition** asks the quicker recognizer, which has a model for English, French, German, Italian, Spanish and Portuguese. It reads some other scripts well and turns others into Latin nonsense, so leave the setting off if you read Thai, Chinese, Korean, Russian or Arabic. TextS falls back to the accurate recognizer when the quicker one finds nothing at all, which is why a selection in those languages can still come back correct.
 

@@ -22,14 +22,14 @@ unsafe extern "C" {}
 
 type CFTypeRef = *mut std::ffi::c_void;
 
-/// The message a broken recognizer produces. The quick level keeps working
-/// after the accurate one has failed, so this is the signal to fall back.
+/// Engine failure that a fresh helper may recover from.
 const RECOGNIZER_FAILED: &str = "The macOS text recognizer stopped working.";
 
 unsafe extern "C" {
     fn CGImageSourceCreateWithData(data: CFTypeRef, options: CFTypeRef) -> CFTypeRef;
     fn CGImageSourceGetCount(source: CFTypeRef) -> isize;
     fn CGImageSourceCopyPropertiesAtIndex(source: CFTypeRef, index: isize, options: CFTypeRef) -> CFTypeRef;
+    fn CGImageSourceCreateImageAtIndex(source: CFTypeRef, index: isize, options: CFTypeRef) -> CFTypeRef;
     fn CFRelease(value: CFTypeRef);
 }
 
@@ -46,7 +46,7 @@ fn run() -> Result<(), String> {
     let mut warmup = false;
     for arg in env::args_os().skip(1) {
         if arg == "--help" || arg == "-h" {
-            println!("Usage: textsniper-rs [--server] [--warmup] [IMAGE]\n\nSelect a screen region or OCR an image, then copy recognized text to the clipboard.\n\nWith --server, read one request per line from standard input and answer each with\na single line of \"OK <bytes>\", \"OKQUICK <bytes>\" or \"ERROR <bytes>\" followed by that\nmany bytes of UTF-8. A request is an image path, optionally prefixed with \"fast\\t\" for\nthe quicker recognition level. The process stays alive so the OCR models stay loaded.\n\nWith --warmup, load the recognition models for an image and exit. Nothing is printed\nor copied, and the exit code says whether the accurate recognizer works.");
+            println!("Usage: textsniper-rs [--server] [--warmup] [IMAGE]\n\nSelect a screen region or OCR an image, then copy recognized text to the clipboard.\n\nWith --server, read one request per line from standard input and answer each with\na single line of \"OK <bytes>\", \"HELPER_ERROR <bytes>\" or \"ERROR <bytes>\" followed by that\nmany bytes of UTF-8. A request is an image path, optionally prefixed with \"fast\\t\" for\nthe quicker recognition level. The process stays alive so the OCR models stay loaded.\n\nWith --warmup, load the recognition models for an image and exit. Nothing is printed\nor copied, and the exit code says whether the accurate recognizer works.");
             return Ok(());
         } else if arg == "--server" {
             server = true;
@@ -73,8 +73,7 @@ fn run() -> Result<(), String> {
     }
 
     let text = if let Some(path) = image.as_deref() {
-        let mut accurate_broken = false;
-        recognize_request(path, false, &mut accurate_broken).0?
+        recognize(path, false)?
     } else {
         recognize_data(&capture_region()?, false)?
     };
@@ -101,11 +100,6 @@ fn serve() -> Result<(), String> {
     // and the app starts a fresh helper for the next request.
     const MAX_CONSECUTIVE_ERRORS: u32 = 4;
     let mut consecutive_errors = 0;
-    // The accurate recognizer can fail on some Macs, and a failed request
-    // leaves it unusable for the rest of this process. Once that has
-    // happened, keep using the quick level, which keeps working, so every
-    // capture still produces text.
-    let mut accurate_broken = false;
     for line in stdin.lock().lines() {
         let line = line.map_err(|error| format!("could not read standard input: {error}"))?;
         let (level, path) = match line.split_once('\t') {
@@ -115,7 +109,7 @@ fn serve() -> Result<(), String> {
         if path.is_empty() {
             continue;
         }
-        let (text, quick) = recognize_request(Path::new(path), level == "fast", &mut accurate_broken);
+        let text = recognize(Path::new(path), level == "fast");
         let outcome = text.and_then(|text| {
             if text.trim().is_empty() {
                 return Err("no text found".into());
@@ -127,10 +121,7 @@ fn serve() -> Result<(), String> {
         let failed = !matches!(outcome, Ok(_)) && !matches!(&outcome, Err(message) if message == "no text found");
         consecutive_errors = if failed { consecutive_errors + 1 } else { 0 };
         let retiring = consecutive_errors >= MAX_CONSECUTIVE_ERRORS;
-        match outcome {
-            Ok(text) => write_frame(&mut stdout, if quick { "OKQUICK" } else { "OK" }, &text)?,
-            Err(message) => write_frame(&mut stdout, "ERROR", &message)?,
-        }
+        write_response(&mut stdout, outcome)?;
         if retiring {
             break;
         }
@@ -138,28 +129,13 @@ fn serve() -> Result<(), String> {
     Ok(())
 }
 
-/// Runs one capture through the recognizer. The accurate level is tried
-/// first. When it fails, the same image goes through the quick level, which
-/// keeps working after the accurate one has broken. The second value says the
-/// text came from the quick level, so the caller can say so.
-fn recognize_request(
-    path: &Path,
-    fast: bool,
-    accurate_broken: &mut bool,
-) -> (Result<String, String>, bool) {
-    if fast {
-        return (recognize_with_retry(path, true), false);
-    }
-    if *accurate_broken {
-        return (recognize_with_retry(path, true), true);
-    }
-    match recognize_with_retry(path, false) {
-        Ok(text) => (Ok(text), false),
-        Err(error) if error == RECOGNIZER_FAILED => {
-            *accurate_broken = true;
-            (recognize_with_retry(path, true), true)
+fn write_response(output: &mut impl Write, outcome: Result<String, String>) -> Result<(), String> {
+    match outcome {
+        Ok(text) => write_frame(output, "OK", &text),
+        Err(message) => {
+            let status = if message == RECOGNIZER_FAILED { "HELPER_ERROR" } else { "ERROR" };
+            write_frame(output, status, &message)
         }
-        Err(error) => (Err(error), false),
     }
 }
 
@@ -214,44 +190,37 @@ fn recognize(path: &Path, fast: bool) -> Result<String, String> {
     recognize_data(&image, fast)
 }
 
-/// A read that fails straight after the models finish loading is transient, so
-/// give it one more go before reporting a problem. `no text found` is a real
-/// answer about the image rather than a failed read, so it is passed straight
-/// through.
-fn recognize_with_retry(path: &Path, fast: bool) -> Result<String, String> {
-    match recognize(path, fast) {
-        Err(error) if error != "no text found" => recognize(path, fast),
-        outcome => outcome,
-    }
-}
-
 fn recognize_data(image_data: &[u8], fast: bool) -> Result<String, String> {
     if image_data.is_empty() {
         return Err("image is empty".into());
     }
-    let image_length = image_data.len();
     unsafe {
         let pool: Id = msg_send![class!(NSAutoreleasePool), new];
         // The size check reads the header through a temporary NSData, so it has
         // to run inside the pool. Before it, that object has nowhere to go and
         // leaks a copy of the image on every capture.
-        let (width, height) = match pixel_size(image_data) {
-            Ok(size) => size,
+        let (width, height, orientation, picture) = match decode_image(image_data) {
+            Ok(decoded) => decoded,
             Err(error) => {
                 let _: () = msg_send![pool, drain];
                 return Err(error);
             }
         };
         if width < 2 || height < 2 {
+            CFRelease(picture);
             let _: () = msg_send![pool, drain];
             return Err(format!(
                 "That selection is {width} by {height} pixels. Select a larger area."
             ));
         }
-        let image: Id = msg_send![class!(NSData), dataWithBytes: image_data.as_ptr() length: image_length];
+        // Vision reads a decoded picture. Decoding it here hands Vision the
+        // image and its orientation directly, and keeps the raw bytes out of
+        // the request.
         let handler: Id = msg_send![class!(VNImageRequestHandler), alloc];
         let options: Id = msg_send![class!(NSDictionary), dictionary];
-        let handler: Id = msg_send![handler, initWithData: image options: options];
+        let handler: Id = msg_send![handler, initWithCGImage: picture as Id
+                                                  orientation: orientation
+                                                    options: options];
         // `alloc`/`init` and `new` both return +1 ownership that the autorelease
         // pool does not adopt. This process serves every capture for the whole
         // app session, so leaving these alive grows memory without bound until
@@ -281,6 +250,7 @@ fn recognize_data(image_data: &[u8], fast: bool) -> Result<String, String> {
             };
             release(request);
             release(handler);
+            CFRelease(picture);
             let _: () = msg_send![pool, drain];
             return Err(friendly_error(&message));
         }
@@ -301,6 +271,7 @@ fn recognize_data(image_data: &[u8], fast: bool) -> Result<String, String> {
         }
         release(request);
         release(handler);
+        CFRelease(picture);
         let _: () = msg_send![pool, drain];
         let text = lines.join("\n");
         if fast && text.trim().is_empty() {
@@ -314,11 +285,44 @@ fn recognize_data(image_data: &[u8], fast: bool) -> Result<String, String> {
     }
 }
 
-/// Gives the request the languages its own recognition level supports, with
-/// the Chinese, Japanese and Korean models first. Vision reads a selection
-/// that mixes scripts with the first language in the list that fits, so a
-/// screen that shows Chinese next to English keeps both halves. The automatic
-/// detection still picks the language of a selection written in one script.
+/// The languages a request asks for: the Chinese, Japanese and Korean models
+/// first, then the rest, up to seven.
+///
+/// Vision reads a selection that mixes scripts with the first language in the
+/// list that fits, so a screen that shows Chinese next to English keeps both
+/// halves. The automatic detection still picks the language of a selection
+/// written in one script, so the languages after the CJK ones are only there
+/// to win a line that mixes two scripts.
+///
+/// The list stops at seven. Every language in it needs its own correction
+/// model, and building those is what makes a read slow: asking for all
+/// thirty-three languages macOS knows took 46 seconds to build them, while
+/// seven takes a few seconds and reads every script the same.
+fn ordered_languages(supported: &[String]) -> Vec<String> {
+    const FIRST: [&str; 6] = ["zh-Hans", "zh-Hant", "yue-Hans", "yue-Hant", "ja-JP", "ko-KR"];
+    const LIMIT: usize = 7;
+    let mut ordered: Vec<String> = Vec::new();
+    for wanted in FIRST {
+        if ordered.len() == LIMIT {
+            break;
+        }
+        if let Some(found) = supported.iter().find(|language| *language == wanted) {
+            ordered.push(found.clone());
+        }
+    }
+    for language in supported {
+        if ordered.len() == LIMIT {
+            break;
+        }
+        if FIRST.contains(&language.as_str()) {
+            continue;
+        }
+        ordered.push(language.clone());
+    }
+    ordered
+}
+
+/// Gives the request the languages its own recognition level supports.
 fn set_supported_languages(request: Id) {
     unsafe {
         let supported: bool = msg_send![
@@ -333,24 +337,17 @@ fn set_supported_languages(request: Id) {
         if languages.is_null() {
             return;
         }
-        const FIRST: [&str; 6] = ["zh-Hans", "zh-Hant", "yue-Hans", "yue-Hant", "ja-JP", "ko-KR"];
         let count: usize = msg_send![languages, count];
-        let ordered: Id = msg_send![class!(NSMutableArray), array];
-        for wanted in FIRST {
-            for index in 0..count {
-                let language: Id = msg_send![languages, objectAtIndex: index];
-                if object_string(language) == wanted {
-                    let _: () = msg_send![ordered, addObject: language];
-                    break;
-                }
-            }
-        }
+        let mut available: Vec<String> = Vec::with_capacity(count);
         for index in 0..count {
             let language: Id = msg_send![languages, objectAtIndex: index];
-            if FIRST.contains(&object_string(language).as_str()) {
-                continue;
-            }
-            let _: () = msg_send![ordered, addObject: language];
+            available.push(object_string(language));
+        }
+        let ordered: Id = msg_send![class!(NSMutableArray), array];
+        for language in ordered_languages(&available) {
+            let bytes = CString::new(language).unwrap_or_default();
+            let value: Id = msg_send![class!(NSString), stringWithUTF8String: bytes.as_ptr()];
+            let _: () = msg_send![ordered, addObject: value];
         }
         let _: () = msg_send![request, setRecognitionLanguages: ordered];
     }
@@ -360,9 +357,10 @@ unsafe fn release(object: Id) {
     let _: () = msg_send![object, release];
 }
 
-/// Reads the pixel size from the header alone, so a thin selection is reported
-/// as such instead of reaching the image reader.
-fn pixel_size(image_data: &[u8]) -> Result<(usize, usize), String> {
+/// Decodes the picture once. The pixel size comes from the header alone, so a
+/// thin selection is reported as such instead of reaching the image reader,
+/// and the decoded image is what Vision reads.
+fn decode_image(image_data: &[u8]) -> Result<(usize, usize, u32, CFTypeRef), String> {
     unsafe {
         let data: Id = msg_send![class!(NSData), dataWithBytes: image_data.as_ptr() length: image_data.len()];
         let source = CGImageSourceCreateWithData(data as CFTypeRef, ptr::null_mut());
@@ -385,14 +383,26 @@ fn pixel_size(image_data: &[u8]) -> Result<(usize, usize), String> {
             Some(value)
         };
         let size = (dimension("PixelWidth"), dimension("PixelHeight"));
+        // Vision reads a decoded image, so the orientation the file carries
+        // has to be handed over with it. A screenshot has none and reads
+        // upright.
+        let orientation = dimension("Orientation").unwrap_or(1) as u32;
         if !properties.is_null() {
             CFRelease(properties as CFTypeRef);
         }
-        CFRelease(source);
-        return match size {
-            (Some(width), Some(height)) if count > 0 && width > 0 && height > 0 => Ok((width, height)),
-            _ => Err("TextS could not read that selection. Select it again.".into()),
+        let (width, height) = match size {
+            (Some(width), Some(height)) if count > 0 && width > 0 && height > 0 => (width, height),
+            _ => {
+                CFRelease(source);
+                return Err("TextS could not read that selection. Select it again.".into());
+            }
         };
+        let picture = CGImageSourceCreateImageAtIndex(source, 0, ptr::null_mut());
+        CFRelease(source);
+        if picture.is_null() {
+            return Err("TextS could not read that selection. Select it again.".into());
+        }
+        Ok((width, height, orientation, picture))
     }
 }
 
@@ -433,50 +443,53 @@ fn set_clipboard(text: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RECOGNIZER_FAILED, recognize_data};
+    use super::{RECOGNIZER_FAILED, ordered_languages, recognize_data, write_response};
 
-    const CHINESE: &[u8] = include_bytes!("../tests/fixtures/chinese.png");
-    const MIXED: &[u8] = include_bytes!("../tests/fixtures/mixed.png");
-    const CHINESE_SMALL: &[u8] = include_bytes!("../tests/fixtures/chinese_small.png");
+    /// The languages macOS lists for the accurate level on this machine.
+    const ACCURATE: [&str; 33] = [
+        "en-US", "fr-FR", "it-IT", "de-DE", "es-ES", "pt-BR", "zh-Hans", "zh-Hant", "yue-Hans",
+        "yue-Hant", "ko-KR", "ja-JP", "ru-RU", "uk-UA", "th-TH", "vi-VT", "ar-SA", "ars-SA",
+        "tr-TR", "id-ID", "cs-CZ", "da-DK", "nl-NL", "no-NO", "nn-NO", "nb-NO", "ms-MY", "pl-PL",
+        "ro-RO", "sv-SE", "fi-FI", "hi-IN", "mr-IN",
+    ];
 
-    /// Reads a fixture, or reports that the recognizer on this Mac stopped
-    /// working. It does that on some Macs, and a check that cannot run is not
-    /// a failure.
-    fn read(fixture: &[u8], fast: bool) -> Option<String> {
-        match recognize_data(fixture, fast) {
-            Ok(text) => Some(text),
-            Err(error) if error == RECOGNIZER_FAILED => {
-                eprintln!("skipped: the macOS recognizer stopped working");
-                None
-            }
-            Err(error) => panic!("{error}"),
+    /// The Chinese, Japanese and Korean models come first, so a line that
+    /// mixes scripts keeps its Chinese half, and the list stays short, so the
+    /// first read does not build a correction model for every language macOS
+    /// knows.
+    #[test]
+    fn language_list_is_cjk_first_and_short() {
+        let supported: Vec<String> = ACCURATE.iter().map(|language| language.to_string()).collect();
+        let ordered = ordered_languages(&supported);
+        assert_eq!(ordered.len(), 7, "asked for {ordered:?}");
+        assert_eq!(
+            ordered,
+            ["zh-Hans", "zh-Hant", "yue-Hans", "yue-Hant", "ja-JP", "ko-KR", "en-US"]
+        );
+    }
+
+    /// The quick level only has six languages and no CJK model, and the limit
+    /// must not cut them out.
+    #[test]
+    fn language_list_keeps_every_language_a_level_offers() {
+        let supported: Vec<String> = ["en-US", "fr-FR", "it-IT", "de-DE", "es-ES", "pt-BR"]
+            .iter()
+            .map(|language| language.to_string())
+            .collect();
+        assert_eq!(ordered_languages(&supported), supported);
+    }
+
+    #[test]
+    fn server_distinguishes_engine_failure_from_rejected_images() {
+        for (outcome, expected) in [
+            (Err(RECOGNIZER_FAILED.into()), format!("HELPER_ERROR {}\n{RECOGNIZER_FAILED}", RECOGNIZER_FAILED.len())),
+            (Err("no text found".into()), "ERROR 13\nno text found".into()),
+            (recognize_data(b"invalid image", false), "ERROR 53\nTextS could not read that selection. Select it again.".into()),
+            (Ok("你好".into()), "OK 6\n你好".into()),
+        ] {
+            let mut bytes = Vec::new();
+            write_response(&mut bytes, outcome).unwrap();
+            assert_eq!(String::from_utf8(bytes).unwrap(), expected);
         }
     }
-
-    /// The accurate recognizer has to read Chinese.
-    #[test]
-    fn accurate_recognizer_reads_chinese() {
-        let Some(text) = read(CHINESE, false) else { return };
-        assert!(text.contains("你好，世界。"), "read {text:?}");
-    }
-
-    /// A selection that mixes Chinese with English has to keep the Chinese
-    /// half. Vision reads each line with the model that fits it best, so a
-    /// line that is mostly Chinese has to come back whole.
-    #[test]
-    fn accurate_recognizer_keeps_both_scripts_in_one_selection() {
-        let Some(text) = read(MIXED, false) else { return };
-        assert!(text.contains("偏好设置"), "read {text:?}");
-        assert!(text.contains("Preferences"), "read {text:?}");
-    }
-
-    /// The quick recognizer has no Chinese model, so it finds nothing in small
-    /// Chinese text. The helper reads it with the accurate recognizer instead
-    /// of telling the user the selection holds no text.
-    #[test]
-    fn quick_recognizer_falls_back_when_it_finds_nothing() {
-        let Some(text) = read(CHINESE_SMALL, true) else { return };
-        assert!(text.contains("这是一个中文识别测试。"), "read {text:?}");
-    }
 }
-

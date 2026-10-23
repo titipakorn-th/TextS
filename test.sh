@@ -6,10 +6,10 @@ BUILD="$ROOT/.build/test"
 ARCH="$(uname -m)"
 mkdir -p "$BUILD"
 
-# The OCR helper's own checks. The recognizer answers one request at a time,
-# so the tests run one after another.
+# Protocol checks do not load Vision's recognition models.
 cd "$ROOT"
 cargo test -- --test-threads=1
+cargo build
 
 # The app sources are built as a module so the check drives the code the app
 # ships, not a copy of it.
@@ -23,4 +23,4 @@ swiftc -enable-testing -module-name OCRTimeoutCheck \
   -target "$ARCH-apple-macosx13.0" -I "$BUILD" -L "$BUILD" -lTextS \
   "$ROOT/tests/main.swift" -o "$BUILD/ocr-timeout-check"
 
-"$BUILD/ocr-timeout-check"
+"$BUILD/ocr-timeout-check" "$ROOT/target/debug/textsniper-rs" "$ROOT/tests/fixtures"

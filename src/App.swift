@@ -7,8 +7,6 @@ import ServiceManagement
 enum CaptureOutcome {
     /// The recognized text is on the clipboard.
     case success
-    /// The accurate recognizer failed and the quick one did the work.
-    case successQuick
     /// The user backed out of the region selection, so there is nothing to report.
     case canceled
     /// A real answer about the selection. Repeating it will not change it.
@@ -96,17 +94,18 @@ final class OCRWorker: @unchecked Sendable {
     /// than as an error anyone can act on, and a restart recovers cleanly.
     private static let residentByteLimit: UInt64 = 600 * 1024 * 1024
 
-    /// How long the accurate recognizer may take to answer. The models are
-    /// loaded before the first capture, so a healthy request answers in a
-    /// fraction of a second. A request that is still running after this has
-    /// hit the problem the app already knows about: the recognizer is slow or
-    /// broken on this Mac, and the quick one is the answer that can still come.
-    private static let accurateFrameTimeout: TimeInterval = 5
+    /// How long the accurate recognizer may take to answer. The neural engine
+    /// compiles the recognition models the first time a picture is read, and
+    /// on a cold Mac that takes tens of seconds. A capture that runs into that
+    /// has to be allowed to finish, because a request cut short leaves the
+    /// models half-built and the next one no faster.
+    static let accurateFrameTimeout: TimeInterval = 90
 
     /// How long the quick recognizer may take. It carries a lighter model, so
-    /// it answers as soon as that model is loaded, even on a Mac where the
-    /// accurate model is slow to load.
-    private static let quickFrameTimeout: TimeInterval = 45
+    /// it answers as soon as that model is loaded.
+    static let quickFrameTimeout: TimeInterval = 45
+
+    private let frameTimeoutOverride: TimeInterval?
 
     var overMemoryLimit: Bool { residentSize > Self.residentByteLimit }
 
@@ -122,7 +121,8 @@ final class OCRWorker: @unchecked Sendable {
         return UInt64(info.pti_resident_size)
     }
 
-    init?() {
+    init?(frameTimeout: TimeInterval? = nil) {
+        self.frameTimeoutOverride = frameTimeout
         process.executableURL = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/textsniper-rs")
         process.arguments = ["--server"]
         let outputPipe = Pipe()
@@ -144,12 +144,10 @@ final class OCRWorker: @unchecked Sendable {
             // One deadline covers the whole frame. Reading the pipe directly
             // waited for as long as the helper wanted, including forever when
             // it wedged, and that left the app unable to capture anything again.
-            // The accurate recognizer gets a short budget because its models
-            // are already loaded; the quick one gets longer, as it may still be
-            // loading its own.
-            let deadline = Date().addingTimeInterval(
-                fast ? Self.quickFrameTimeout : Self.accurateFrameTimeout
-            )
+            // The accurate recognizer gets more room because it may still be
+            // waiting for the neural engine to compile its models.
+            let timeout = frameTimeoutOverride ?? (fast ? Self.quickFrameTimeout : Self.accurateFrameTimeout)
+            let deadline = Date().addingTimeInterval(timeout)
             let request = fast ? "fast\t\(path)\n" : "\(path)\n"
             do {
                 try input.write(contentsOf: Data(request.utf8))
@@ -180,8 +178,8 @@ final class OCRWorker: @unchecked Sendable {
         switch parts[0] {
         case "OK":
             return payload.isEmpty ? .rejected("No text found") : .success
-        case "OKQUICK":
-            return payload.isEmpty ? .rejected("No text found") : .successQuick
+        case "HELPER_ERROR":
+            return .helperFailed(payload.isEmpty ? "The OCR helper stopped responding." : payload)
         case "ERROR":
             return .rejected(payload.isEmpty ? "TextS could not read that selection." : payload)
         default:
@@ -205,9 +203,13 @@ final class OCRWorker: @unchecked Sendable {
     /// would read that remainder as its header.
     private func readExactly(_ count: Int, deadline: Date) -> String? {
         var data = Data()
+        var buffer = [UInt8](repeating: 0, count: min(count, 4096))
         while data.count < count {
-            guard let chunk = try? output.read(upToCount: count - data.count), !chunk.isEmpty else { return nil }
-            data.append(chunk)
+            guard waitReadable(deadline: deadline) else { return nil }
+            let bytesRead = Darwin.read(output.fileDescriptor, &buffer, min(buffer.count, count - data.count))
+            if bytesRead < 0 && errno == EINTR { continue }
+            guard bytesRead > 0 else { return nil }
+            data.append(contentsOf: buffer.prefix(bytesRead))
         }
         return String(decoding: data, as: UTF8.self)
     }
@@ -276,31 +278,23 @@ private func captureSelection(
     }
     defer { try? FileManager.default.removeItem(at: imageURL) }
 
+    return recognizeSelection(at: imageURL.path, fast: fast, onRecognizing: onRecognizing,
+                              worker: worker, replacement: replacement)
+}
+
+func recognizeSelection(
+    at path: String,
+    fast: Bool,
+    onRecognizing: () -> Void = {},
+    worker: () -> OCRWorker?,
+    replacement: () -> OCRWorker?
+) -> CaptureOutcome {
     guard let ocr = worker() else { return .rejected("Could not start OCR.") }
     onRecognizing()
-    let outcome = ocr.recognize(at: imageURL.path, fast: fast)
+    let outcome = ocr.recognize(at: path, fast: fast)
     guard case .helperFailed = outcome, let fresh = replacement() else { return outcome }
-    // The helper did not answer, so a fresh one reads the image that was
-    // already selected. It reads it with the quick recognizer: the accurate
-    // one is the part that stopped answering, and the quick one keeps working
-    // after the accurate one fails.
     onRecognizing()
-    return rereadWithQuickRecognizer(fresh, path: imageURL.path)
-}
-
-/// Reads an image again with a fresh helper and the quick recognizer. The
-/// answer comes from the quick recognizer, so it is reported as such.
-func rereadWithQuickRecognizer(_ worker: OCRWorker, path: String) -> CaptureOutcome {
-    let outcome = worker.recognize(at: path, fast: true)
-    if case .success = outcome { return .successQuick }
-    return outcome
-}
-
-/// Whether the accurate recognizer can be used after the setting changes.
-/// Turning the setting off brings it back, even when it stopped working
-/// earlier in the session, because the user asked for accurate text.
-func accurateRecognizerAfterToggle(settingOn: Bool, wasReady: Bool) -> Bool {
-    settingOn ? wasReady : true
+    return fresh.recognize(at: path, fast: fast)
 }
 
 /// The recognizer a capture uses.
@@ -308,11 +302,6 @@ enum Recognizer {
     case accurate
     /// The quick one, because the setting asks for it.
     case quickForSpeed
-    /// The quick one, because the accurate one is not working.
-    case quickBecauseAccurateFailed
-
-    /// True for the quick recognizer, which answers straight away.
-    var isQuick: Bool { self != .accurate }
 
     /// What the settings window shows, so the mode in use is never a guess.
     var status: String {
@@ -321,18 +310,12 @@ enum Recognizer {
             return "In use: the accurate recognizer."
         case .quickForSpeed:
             return "In use: the quick recognizer. Faster recognition is on."
-        case .quickBecauseAccurateFailed:
-            return "In use: the quick recognizer. The accurate one is not working."
         }
     }
 }
 
-/// Which recognizer a capture uses. The quick one answers straight away, but
-/// it cannot read every language, so the accurate one is used whenever it
-/// works.
-func recognizerInUse(settingOn: Bool, accurateReady: Bool) -> Recognizer {
-    if settingOn { return .quickForSpeed }
-    return accurateReady ? .accurate : .quickBecauseAccurateFailed
+func recognizerInUse(settingOn: Bool) -> Recognizer {
+    settingOn ? .quickForSpeed : .accurate
 }
 
 /// Grabs the region `screencapture -i -c` writes to the clipboard.
@@ -397,10 +380,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var feedbackDismissal: DispatchWorkItem?
     private var feedbackGeneration = 0
     private var ocrWorker: OCRWorker?
-    /// True once the macOS recognizer has proved it can read accurately on
-    /// this Mac. Until then, captures use the quick recognizer, which works
-    /// straight away instead of waiting for the models to load.
-    private var accurateRecognizerReady = false
     private var fastControl: NSButton!
     private var fastDescription: NSTextField!
     private var recognizerStatus: NSTextField!
@@ -439,9 +418,70 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.delegate = self
         registerHotKey()
         createSettingsWindow()
-        _ = ensureOCR()
-        warmUpOCR()
+        startWarmup()
         checkForUpdatesInBackground()
+    }
+
+    /// Loads the recognition models ahead of the first capture.
+    ///
+    /// The neural engine compiles these models the first time a picture is
+    /// read, and on a busy Mac that takes over a minute. Doing it here keeps
+    /// that wait off the capture. It runs in a throwaway process because a
+    /// read that takes that long leaves the recognizer unable to read
+    /// anything else, and this one has no more reading to do.
+    ///
+    /// Nothing waits for this and nothing depends on it. The mode a capture
+    /// uses is the mode the user picked, whatever this is doing.
+    private func startWarmup() {
+        guard let imageURL = Self.warmupImage() else { return }
+        let warmup = Process()
+        warmup.executableURL = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/textsniper-rs")
+        warmup.arguments = ["--warmup", imageURL.path]
+        warmup.standardOutput = FileHandle.nullDevice
+        warmup.standardError = FileHandle.nullDevice
+        DispatchQueue.global(qos: .utility).async {
+            do {
+                try warmup.run()
+                warmup.waitUntilExit()
+            } catch {
+                // A warmup that cannot start is not worth reporting: the
+                // capture will read the models itself if it has to.
+            }
+            try? FileManager.default.removeItem(at: imageURL)
+        }
+    }
+
+    /// A short line of text in the scripts the accurate recognizer is needed
+    /// for. It only has to be readable: the point is to pull the models in, so
+    /// a small picture is quick to read once they arrive. Every script the
+    /// recognizer is asked for appears here, so the models it needs are the
+    /// ones this warms.
+    private static func warmupImage() -> URL? {
+        let size = NSSize(width: 520, height: 180)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        NSColor.white.setFill()
+        NSRect(origin: .zero, size: size).fill()
+        let lines = ["TextS is loading its recognizer", "中文字符识别", "中文字符識別",
+                     "日本語の文字", "한국어 문자"]
+        for (index, line) in lines.enumerated() {
+            (line as NSString).draw(
+                in: NSRect(x: 16, y: 16 + CGFloat(index) * 32, width: size.width - 32, height: 32),
+                withAttributes: [.font: NSFont.systemFont(ofSize: 20),
+                                 .foregroundColor: NSColor.black])
+        }
+        image.unlockFocus()
+        guard let tiff = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff),
+              let png = bitmap.representation(using: .png, properties: [:]) else { return nil }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("textsniper-warmup-\(UUID().uuidString).png")
+        do {
+            try png.write(to: url)
+            return url
+        } catch {
+            return nil
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -458,7 +498,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         isCapturing = true
-        let fast = recognizerInUse(settingOn: fastRecognition, accurateReady: accurateRecognizerReady).isQuick
+        let fast = fastRecognition
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let outcome = captureSelection(
                 fast: fast,
@@ -471,21 +511,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.isCapturing = false
                 switch outcome {
                 case .success:
-                    // The accurate recognizer answered inside its budget, so
-                    // the text came from it. The quick one steps in only when
-                    // the accurate one fails, which arrives as .successQuick.
-                    // Only explain the quick recognizer when TextS chose it
-                    // for itself, not when it was asked for in Settings.
-                    let usedQuick = !self.fastRecognition && fast
-                    self.showFeedback(title: "Copied to clipboard",
-                                      detail: usedQuick ? "Recognized with the quick recognizer."
-                                                        : "Your text is ready to paste.",
-                                      success: true)
-                case .successQuick:
-                    // The accurate recognizer failed, so stop asking for it.
-                    self.accurateRecognizerReady = false
-                    self.updateRecognizerStatus()
-                    self.showFeedback(title: "Copied to clipboard", detail: "Recognized with the quick recognizer.", success: true)
+                    self.showFeedback(title: "Copied to clipboard", detail: "Your text is ready to paste.", success: true)
                 case .canceled:
                     break
                 case .rejected(let message):
@@ -494,10 +520,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     // This helper is no longer answering, so it is retired here
                     // and the next capture starts a clean one.
                     self.retireOCR()
-                    // The accurate recognizer did not answer, so stop asking
-                    // for it and let the quick one read the next selection.
-                    if !fast { self.accurateRecognizerReady = false }
-                    self.updateRecognizerStatus()
                     self.showFeedback(title: "Couldn’t copy text", detail: message, success: false)
                 }
             }
@@ -650,13 +672,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func toggleFastRecognition() {
         let on = fastControl.state == .on
         UserDefaults.standard.set(on, forKey: "fastRecognition")
-        accurateRecognizerReady = accurateRecognizerAfterToggle(settingOn: on, wasReady: accurateRecognizerReady)
         updateRecognizerStatus()
-        if !on {
-            // The helper that failed the accurate recognizer cannot read
-            // accurately any more, so give it a fresh one.
-            _ = restartOCR()
-        }
     }
 
     private func updateFastRecognitionState() {
@@ -666,8 +682,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Shows which recognizer the next capture uses, so the mode is never a
     /// guess.
     private func updateRecognizerStatus() {
-        recognizerStatus?.stringValue = recognizerInUse(settingOn: fastRecognition,
-                                                        accurateReady: accurateRecognizerReady).status
+        recognizerStatus?.stringValue = recognizerInUse(settingOn: fastRecognition).status
     }
 
     private func separator() -> NSView {
@@ -853,67 +868,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private func retireOCR() {
         ocrWorker?.stop()
         ocrWorker = nil
-    }
-
-    /// Loads the macOS recognition models ahead of the first capture, so a
-    /// capture does not have to wait for them.
-    ///
-    /// This runs in a throwaway process on purpose. The models can take tens
-    /// of seconds to load, and any request that runs alongside the load waits
-    /// for it, so the load has to happen where it cannot hold up a capture.
-    /// The models are shared system wide, so the helper that serves captures
-    /// often finds them ready. When the accurate recognizer turns out not to
-    /// work on this Mac, captures keep using the quick one.
-    private func warmUpOCR() {
-        guard let imageURL = Self.warmupImage() else { return }
-        let warmup = Process()
-        warmup.executableURL = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/textsniper-rs")
-        warmup.arguments = ["--warmup", imageURL.path]
-        warmup.standardOutput = FileHandle.nullDevice
-        warmup.standardError = FileHandle.nullDevice
-        DispatchQueue.global(qos: .utility).async {
-            do {
-                try warmup.run()
-                warmup.waitUntilExit()
-                let ready = warmup.terminationStatus == 0
-                DispatchQueue.main.async {
-                    self.accurateRecognizerReady = ready
-                    self.updateRecognizerStatus()
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self.accurateRecognizerReady = false
-                    self.updateRecognizerStatus()
-                }
-            }
-            try? FileManager.default.removeItem(at: imageURL)
-        }
-    }
-
-    /// A short line of text. It only has to be readable: the point is to pull
-    /// the models in, and a small image is quick to read once they arrive.
-    private static func warmupImage() -> URL? {
-        let size = NSSize(width: 420, height: 80)
-        let image = NSImage(size: size)
-        image.lockFocus()
-        NSColor.white.setFill()
-        NSRect(origin: .zero, size: size).fill()
-        ("TextS is loading its recognizer" as NSString).draw(
-            in: NSRect(x: 16, y: 16, width: size.width - 32, height: size.height - 32),
-            withAttributes: [.font: NSFont.systemFont(ofSize: 20),
-                             .foregroundColor: NSColor.black])
-        image.unlockFocus()
-        guard let tiff = image.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiff),
-              let png = bitmap.representation(using: .png, properties: [:]) else { return nil }
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("textsniper-warmup-\(UUID().uuidString).png")
-        do {
-            try png.write(to: url)
-            return url
-        } catch {
-            return nil
-        }
     }
 
     @objc private func checkForUpdates() {
