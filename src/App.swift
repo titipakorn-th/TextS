@@ -451,19 +451,21 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// A short line of text in the scripts the accurate recognizer is needed
-    /// for. It only has to be readable: the point is to pull the models in, so
-    /// a small picture is quick to read once they arrive. Every script the
-    /// recognizer is asked for appears here, so the models it needs are the
-    /// ones this warms.
+    /// A short line of text in each script the accurate recognizer reads with
+    /// its own model. It only has to be readable: the point is to pull the
+    /// models in, so a small picture is quick to read once they arrive. macOS
+    /// compiles a model the first time it meets a script, about 15 seconds
+    /// each, and throws them all away when the helper binary changes, so a
+    /// script missing here makes the first capture after an update wait. Thai,
+    /// Cyrillic and Arabic each build one the Latin and CJK lines do not.
     private static func warmupImage() -> URL? {
-        let size = NSSize(width: 520, height: 180)
+        let size = NSSize(width: 520, height: 290)
         let image = NSImage(size: size)
         image.lockFocus()
         NSColor.white.setFill()
         NSRect(origin: .zero, size: size).fill()
         let lines = ["TextS is loading its recognizer", "中文字符识别", "中文字符識別",
-                     "日本語の文字", "한국어 문자"]
+                     "日本語の文字", "한국어 문자", "ภาษาไทยอ่านได้", "Русский текст", "النص العربي"]
         for (index, line) in lines.enumerated() {
             (line as NSString).draw(
                 in: NSRect(x: 16, y: 16 + CGFloat(index) * 32, width: size.width - 32, height: 32),
